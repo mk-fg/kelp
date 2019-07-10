@@ -1,0 +1,1484 @@
+#!/usr/bin/env python3
+
+import itertools as it, operator as op, functools as ft
+import os, sys, stat, re, time, secrets, json
+import contextlib, asyncio, socket, signal, inspect, traceback
+import hashlib, base64, unicodedata, configparser, tempfile
+import collections as cs, collections.abc as cs_abc, datetime as dt, pathlib as pl
+import logging, logging.handlers
+
+
+class KelpConfigBase:
+
+	version = '1.97' # git-version: py-str
+
+	irc_host = '127.0.0.1'
+	irc_port = 6667
+	irc_password = ''
+	irc_host_af = 0
+	irc_auth_tbf = '30:8'
+
+	irc_len_hwm = 450 # will probably still work with most clients
+	irc_len_lwm = 300
+	irc_len_topic = 300 # cannot be split, so is truncated instead
+	irc_len_monitor = 350 # to tuncate long lines in #monitor
+	irc_len_monitor_lines = 4 # to tuncate multiline msgs in #monitor
+
+	irc_uid_len = 4 # can be increased to fix conflicts
+	irc_uid_seed = ''
+	irc_chan_modes = False # causes needless spam on ZNC reconnects
+
+	debug_verbose = False
+	debug_msg_cut = 50
+	debug_proto_cut = 90
+	debug_proto_log_shared = True
+	debug_proto_log_file = ''
+	debug_proto_log_file_size = int(1.5e6)
+	debug_proto_log_file_count = 9
+	debug_proto_aiohttp = True
+	debug_log_file = '' # not affected by debug_verbose in any way
+	debug_log_file_size = int(1.5e6)
+	debug_log_file_count = 9
+	debug_chan_proto_tail = 50
+	debug_chan_proto_cut = 230
+
+	_conf_path = '~/.kelp.ini'
+	_conf_sections = 'irc', 'debug'
+
+
+
+err_fmt = lambda err: '[{}] {}'.format(err.__class__.__name__, err)
+
+class LogMessage:
+	def __init__(self, fmt, a, k): self.fmt, self.a, self.k = fmt, a, k
+	def __str__(self): return self.fmt.format(*self.a, **self.k) if self.a or self.k else self.fmt
+
+class LogStyleAdapter(logging.LoggerAdapter):
+	def __init__(self, logger, extra=None): super().__init__(logger, extra or {})
+	def log(self, level, msg, *args, **kws):
+		if not self.isEnabledFor(level): return
+		log_kws = dict((k, kws.pop(k, None)) for k in ['extra', 'exc_info'])
+		if not isinstance(log_kws['extra'], dict): log_kws['extra'] = dict(extra=log_kws['extra'])
+		msg, kws = self.process(msg, kws)
+		self.logger._log(level, LogMessage(msg, args, kws), (), **log_kws)
+
+class LogFuncHandler(logging.Handler):
+	def __init__(self, func):
+		super().__init__()
+		self.func, self.locked = func, False
+	def emit(self, record):
+		if self.locked: return # to avoid logging-of-logging loops, assuming sync call
+		self.locked = True
+		try: self.func(self.format(record))
+		# except Exception: self.handleError(record) # too noisy
+		except Exception as err: log_bak.exception('LogFuncHandler failed - {}', err_fmt(err))
+		finally: self.locked = False
+
+class LogEmptyMsgFilter(logging.Filter):
+	def filter(self, record):
+		msg = record.msg
+		return bool(msg if isinstance(msg, str) else msg.fmt)
+log_empty_filter = LogEmptyMsgFilter()
+
+class LogProtoDebugFilter(logging.Filter):
+	debug_re = re.compile(b'^:core (PRIVMSG|NOTICE) #debug :')
+	def filter(self, record):
+		try: st, msg = record.extra
+		except: return True
+		return not ( st == ' >>'
+			and isinstance(msg, bytes)
+			and self.debug_re.search(msg) )
+log_proto_debug_filter = LogProtoDebugFilter()
+
+class LogProtoFormatter(logging.Formatter):
+	last_ts = last_rec = last_reltime = None
+	def format(self, record):
+		if id(record) != self.last_rec:
+			reltime = (record.created - self.last_ts) if self.last_ts else 0
+			self.last_reltime = '{}{:,.3f}'.format('+' if reltime >= 0 else '', reltime)
+			self.last_ts, self.last_rec = record.created, id(record)
+		record.reltime = self.last_reltime
+		record.asctime = time.strftime(
+			'%Y-%m-%dT%H:%M:%S', time.localtime(record.created) )
+		record.asctime += f'.{record.msecs:03.0f}'
+		if record.name.startswith('proto.'): record.name = record.name[6:]
+		try:
+			st, msg = record.extra
+			if isinstance(msg, bytes): msg = json.dumps(msg.decode())
+		except Exception as err:
+			st, msg = 'err', err_fmt(err)
+			log_bak.exception('LogProtoFormatter failed - {}', msg)
+		record.message = f'{st} :: {msg}'
+		return self.formatMessage(record)
+
+class LogFileHandler(logging.handlers.RotatingFileHandler):
+	def set_file(self, path):
+		self.stream, self.baseFilename = None, os.path.abspath(os.fspath(path))
+	def get_file(self): return self.baseFilename
+
+class LogLevelCounter(logging.Handler):
+	def __init__(self, *args, **kws):
+		super().__init__(*args, **kws)
+		self.counts = cs.Counter()
+	def emit(self, record):
+		self.counts['all'] += 1
+		if record.levelno <= logging.DEBUG: return
+		self.counts[record.levelname.lower()] += 1
+
+get_logger = lambda name: LogStyleAdapter(logging.getLogger(name))
+log_bak = get_logger('fallback')
+log_proto_root = logging.getLogger('proto')
+
+
+def setup_aiohttp_trace_logging(log):
+	tc = aiohttp.TraceConfig()
+
+	@contextlib.contextmanager
+	def log_req(part, ident=None, t='req'):
+		if not log.isEnabledFor(logging.DEBUG): return
+		try:
+			dt = ' >>' if t == 'req' else '<< '
+			if ident: log.debug('', extra=(dt, f'{t} :: {ident}'))
+			log.debug('', extra=(dt, f'{t} :: {part} start'))
+			yield log
+			log.debug('', extra=(dt, f'{t} :: {part} end'))
+		except Exception as err:
+			err = err_fmt(err)
+			log.exception( 'Protocol logging failed: {}',
+				err, extra=('xxx', f'{t} :: {part} FAIL :: {err}') )
+
+	# This does not dump all req headers, but should be good enough
+	async def on_req_start(s, tc_ctx, ps):
+		tc_ctx.req_uid = str_hash(os.urandom(8))
+		with log_req('headers', f'[{tc_ctx.req_uid}] {ps.method} {ps.url}') as log:
+			for k, v in ps.headers.items(): log.debug('', extra=('  >', f'  {k}: {v}'))
+	tc.on_request_start.append(on_req_start)
+
+	async def on_req_chunk(s, tc_ctx, ps):
+		a = getattr(tc_ctx, 'pos', 0)
+		b = tc_ctx.pos = a + len(ps.chunk)
+		with log_req('body', f'[{tc_ctx.req_uid}] {a}-{b}') as log:
+			if ps.chunk: log.debug('', extra=('  >', ps.chunk))
+	tc.on_request_chunk_sent.append(on_req_chunk)
+
+	async def on_req_done(s, tc_ctx, ps):
+		res_info = ( '{0.status} {0.reason}'
+			' HTTP/{0.version.major}.{0.version.minor}' ).format(ps.response)
+		with log_req('headers', f'[{tc_ctx.req_uid}] {res_info}', 'res') as log:
+			for k, v in ps.response.headers.items(): log.debug('', extra=('<  ', f'  {k}: {v}'))
+		with log_req('body', f'[{tc_ctx.req_uid}]', 'res') as log:
+			log.debug('', extra=('<  ', await ps.response.read()))
+	tc.on_request_end.append(on_req_done)
+
+	return tc
+
+def sockopt_resolve(prefix, v):
+	prefix = prefix.upper()
+	for k in dir(socket):
+		if not k.startswith(prefix): continue
+		if getattr(socket, k) == v: return k[len(prefix):]
+	return v
+
+# str_norm is not used in irc, where ascii-only casefold is more traditional
+str_norm = lambda v: unicodedata.normalize('NFKC', v.strip()).casefold()
+
+def str_part(s, sep, default=None):
+	'Examples: str_part("user@host", "<@", "root"), str_part("host:port", ":>")'
+	c = sep.strip('<>')
+	if sep.strip(c) == '<': return (default, s) if c not in s else s.split(c, 1)
+	else: return (s, default) if c not in s else s.rsplit(c, 1)
+
+def str_repr(s, max_len=50, len_bytes=False, prefix=False, ext=' ...[{s_len}]'):
+	if isinstance(s, bytes): s = s.decode('utf-8', 'replace')
+	if not isinstance(s, str): s = str(s)
+	s_len, s_repr, ext_tpl = f'{len(s):,d}', repr(s)[1:-1], ext.format(s_len='12/345')
+	if max_len > 0 and len(s_repr) > max_len:
+		s_len = f'{max_len}/{s_len}'
+		if not len_bytes: s_repr = s_repr[:max_len - len(ext_tpl)] + ext.format(s_len=s_len)
+		else:
+			n = max_len - len(ext_tpl.encode())
+			s_repr = s_repr.encode()[:n].decode(errors='ignore') + ext.format(s_len=s_len)
+	return (s_len, s_repr) if prefix else s_repr
+
+irc_name_eq = lambda a, b: a.lower() == b.lower()
+
+
+def str_hash(s, c=None, key='kelp-1'):
+	s = base64.urlsafe_b64encode(
+			hashlib.blake2s(str(s).encode(), key=key.encode()).digest() )\
+		.decode().replace('-', '').replace('_', '').replace('=', '')
+	if c is None: return s
+	if len(s) < c: s = str_hash(s, c, key)
+	return s[:c]
+
+def tuple_hash(t, c=None, key='kelp-1'):
+	s = '\0'.join(str(v).replace('\0', '\0\0') for v in t)
+	return str_hash(s, c=c, key=key)
+
+
+def data_repr(data):
+	pp = getattr(data_repr, '_pp', None)
+	if not pp:
+		import pprint as pp
+		pp = data_repr._pp = pp.PrettyPrinter(indent=2, width=100, compact=True)
+	return pp.pformat(data)
+
+def force_list(v):
+	if not v: v = list()
+	elif isinstance(v, cs_abc.ValuesView): v = list(v)
+	elif not isinstance(v, list): v = [v]
+	return v
+
+def dict_update(d, du_iter=None, sync=True):
+	keys_old, du = set(d.keys()), dict()
+	if du_iter: du.update(du_iter)
+	d.update(du)
+	if sync: return dict((k, d.pop(k)) for k in keys_old.difference(du))
+
+@contextlib.contextmanager
+def safe_replacement(path, *open_args, mode=None, **open_kws):
+	path = str(path)
+	if mode is None:
+		try: mode = stat.S_IMODE(os.lstat(path).st_mode)
+		except OSError: pass
+	open_kws.update( delete=False,
+		dir=os.path.dirname(path), prefix=os.path.basename(path)+'.' )
+	if not open_args: open_kws['mode'] = 'w'
+	with tempfile.NamedTemporaryFile(*open_args, **open_kws) as tmp:
+		try:
+			if mode is not None: os.fchmod(tmp.fileno(), mode)
+			yield tmp
+			if not tmp.closed: tmp.flush()
+			os.rename(tmp.name, path)
+		finally:
+			try: os.unlink(tmp.name)
+			except OSError: pass
+
+def file_tail(p, n, grep=None, bs=100 * 2**10):
+	import mmap
+	lines = list()
+	with open(p,'rb') as src:
+		a, buff, mm = 1, b'', mmap.mmap(
+			src.fileno(), 0, access=mmap.ACCESS_READ )
+		while len(lines) < n:
+			b = a + bs
+			a, buff, end = b, buff + mm[-a:-b:-1], b > len(mm)
+			while True:
+				try: line, buff = buff.split(b'\n', 1)
+				except ValueError:
+					if end and buff: line, buff = buff, b''
+					else: break
+				if line: lines.append(line[::-1].decode())
+			if end: break
+	return list(reversed(lines[:n]))
+
+def token_bucket(spec, negative_tokens=False):
+	'''Spec: { interval_seconds: float | float_a/float_b }[:burst_float]
+			Examples: 1/4:5 (interval=0.25s, rate=4/s, burst=5), 5, 0.5:10, 20:30.
+		Expects a number of tokens (can be float, default: 1)
+			and *always* subtracts these.
+		Yields either None if there's enough
+			tokens or delay (in seconds, float) until when there will be.'''
+	try:
+		try: interval, burst = spec.rsplit(':', 1)
+		except (ValueError, AttributeError): interval, burst = spec, 1.0
+		else: burst = float(burst)
+		if isinstance(interval, str):
+			try: a, b = interval.split('/', 1)
+			except ValueError: interval = float(interval)
+			else: interval = float(a) / float(b)
+		if min(interval, burst) < 0: raise ValueError()
+	except: raise ValueError('Invalid format for rate-limit: {!r}'.format(spec))
+	# log.debug('tbf parameters: interval={:.1f}, burst={:.1f}', interval, burst)
+	tokens, rate, ts_sync = burst, interval**-1, time.monotonic()
+	val = (yield) or 1
+	while True:
+		ts = time.monotonic()
+		ts_sync, tokens = ts, min(burst, tokens + (ts - ts_sync) * rate)
+		val, tokens = (None, tokens - val) if tokens >= val else\
+			((val - tokens) / rate, (tokens - val) if negative_tokens else tokens)
+		val = (yield val) or 1
+
+
+async def aio_await_wrap(res):
+	'Wraps coroutine, callable that creates one or any other awaitable.'
+	if not inspect.isawaitable(res) and callable(res): res = res()
+	if inspect.isawaitable(res): res = await res
+	return res
+
+async def aio_task_cancel(task_list):
+	'Cancel and await a task or a list of such, which can have empty values mixed-in.'
+	if inspect.isawaitable(task_list): task_list = [task_list]
+	task_list = list(filter(None, task_list))
+	for task in task_list:
+		with contextlib.suppress(asyncio.CancelledError): task.cancel()
+	for task in task_list:
+		with contextlib.suppress(asyncio.CancelledError): await task
+
+async def aio_wait_or_cancel(
+		loop, task, timeout, default=..., cancel_suppress=None ):
+	'Like asyncio.wait_for, but also awaits the task that it cancels.'
+	if asyncio.iscoroutine(task): task = loop.create_task(task)
+	try: return await asyncio.wait_for(task, timeout)
+	except asyncio.TimeoutError:
+		if default is ...:
+			err = sys.exc_info()
+			err = err[1].with_traceback(err[2])
+		task.cancel()
+		with contextlib.suppress(
+			asyncio.CancelledError, *(cancel_suppress or list()) ): await task
+		if default is ...: raise err from None
+		else: return default
+
+
+class StacklessContext:
+	'''Like AsyncContextStack, but for tracking tasks that
+		can finish at any point without leaving stack frames.'''
+
+	def __init__(self, log): self.tasks, self.log = dict(), log
+	async def __aenter__(self): return self
+	async def __aexit__(self, *err):
+		if self.tasks:
+			task_list, self.tasks = self.tasks.values(), None
+			await aio_task_cancel(task_list)
+	async def close(self): await self.__aexit__(None, None, None)
+
+	def add_task(self, coro, run_after=None):
+		'Start task eating its own tail, with an optional success-only callback'
+		task_id = None
+		async def _task_wrapper(coro=coro):
+			try:
+				await aio_await_wrap(coro)
+				if run_after:
+					coro = run_after()
+					await aio_await_wrap(coro)
+			except asyncio.CancelledError: pass
+			except Exception as err:
+				self.log.exception('Background task failed: {} - {}', coro, err_fmt(err))
+			finally:
+				assert task_id is not None, task_id
+				if self.tasks: self.tasks.pop(task_id, None)
+		task = asyncio.create_task(_task_wrapper())
+		task_id = id(task)
+		self.tasks[task_id] = task
+		return task
+	add = add_task
+
+
+class adict(dict):
+	def __init__(self, *args, **kws):
+		super().__init__(*args, **kws)
+		self.__dict__ = self
+
+class irc_name_dict(cs.UserDict):
+	value_map = classmethod(
+		lambda cls, names: cls((v, v) for v in names) )
+	def add(self, name): self[name] = name
+	def remove(self, name): del self[name]
+	def __contains__(self, key): return key.lower() in self.data
+	def __getitem__(self, k): return self.data[k.lower()]
+	def __setitem__(self, k, v): self.data[k.lower()] = v
+	def __delitem__(self, k): del self.data[k.lower()]
+
+
+
+class IRCProtocolError(Exception): pass
+class IRCProtocolArgsError(IRCProtocolError): pass
+class IRCBridgeSignal(Exception): pass
+
+class IRCProtocol:
+
+	# Extensive lists of modes are copied from freenode to make clients happy
+	feats_modes = 'DOQRSZaghilopswz CFILMPQSbcefgijklmnopqrstvz'
+	feats_support = ( 'AWAYLEN=200 CASEMAPPING=ascii'
+		' CHANLIMIT=#:512 CHANTYPES=# CHANMODES=eIbq,k,flj,CFLMPQScgimnprstz'
+		' CHANNELLEN=80 ELIST=C NETWORK=kelp NICKLEN=64'
+		' PREFIX=(ov)@+ SAFELIST STATUSMSG=@+ TOPICLEN=390 USERLEN=32' ).split()
+
+	@classmethod
+	def factory_for_bridge(cls, bridge):
+		def _wrapper():
+			try: return cls(bridge)
+			except Exception as err:
+				log = get_logger('kelp.irc.factory')
+				log.exception('Failed to initialize ircd protocol: {}', err_fmt(err))
+				log.critical('Stopping daemon due to unhandled protocol error')
+				bridge.loop.stop()
+		return _wrapper
+
+	def __init__(self, bridge):
+		self.bridge, self.loop, self.conf = bridge, bridge.loop, bridge.conf
+		self.log = get_logger('kelp.irc.init')
+		self.transport, self.buff, self.recv_queue = None, b'', asyncio.Queue()
+		self._cmd_cache, self.st = dict(), adict(
+			nick=None, user=None, pw=None, pw_hash=None,
+			host=None, auth=False, cap_neg=False, away=None,
+			chans=irc_name_dict() )
+		if self.conf.irc_password:
+			salt = os.urandom(8)
+			self.st.pw_hash = salt, hashlib.blake2b(
+				self.conf.irc_password.encode(), salt=salt ).digest()
+
+
+	def connection_made(self, tr):
+		host, port = tr.get_extra_info('peername')[:2]
+		conn_id = tuple_hash([host, port], 3)
+		self.log_proto = get_logger(f'proto.irc.{conn_id}')
+		self.log_proto.debug( '--- -conn- {} {} {}',
+			host, port, conn_id, extra=('---', f'conn {host} {port}') )
+		self.log = get_logger(f'kelp.irc.{conn_id}')
+		self.log.debug('Connection from {} {} [{}]', host, port, conn_id)
+		self.transport, self.st.host = tr, host
+		self.send('NOTICE * :*** kelp ircd ready')
+		self.bridge.irc_conn_new(self)
+		self.bridge.cmd_delay(self.recv_queue_proc)
+
+	def data_received(self, data):
+		self.buff += data
+		while b'\n' in self.buff:
+			line, self.buff = self.buff.split(b'\n', 1)
+			if not line.strip(): continue
+			line_len, line_repr = self._repr(line, True)
+			self.log_proto.debug( '<<  [{} {}] {}',
+				self.st.nick or '---', line_len, line_repr, extra=('<< ', line) )
+			if not line.strip(): continue
+			if self.recv_queue: self.recv_queue.put_nowait(line)
+			else: self.log.error('Data after recv queue stopped: {!r}', line)
+
+	def eof_received(self): pass
+	def connection_lost(self, err):
+		reason = err or 'closed cleanly'
+		if isinstance(reason, Exception): reason = err_fmt(reason)
+		self.log_proto.debug('--- -close- :: {}', reason, extra=('---', 'close'))
+		self.log.debug('Connection lost: {}', reason)
+		if self.recv_queue: self.recv_queue.put_nowait(StopIteration)
+		self.bridge.irc_conn_lost(self)
+
+	def data_send(self, data):
+		data_len, data_repr = self._repr(data, True)
+		self.log_proto.debug( ' >> [{} {}] {}',
+			self.st.nick or '---', data_len, data_repr, extra=(' >>', data) )
+		self.transport.write(data)
+
+
+	def _repr(self, data, prefix=False, max_len=None, ext=' [{data_len}]'):
+		'Binary-only version of str_repr().'
+		if isinstance(data, str): data = data.encode()
+		if max_len is None: max_len = self.conf.debug_proto_cut
+		data_len, data_repr, ext_len = f'{len(data):,d}', repr(data)[2:-1], len(ext)
+		if max_len > 0 and len(data_repr) > max_len:
+			data_len = f'{max_len}/{data_len}'
+			data_repr = data_repr[:max_len - ext_len] + ext.format(data_len=data_len)
+		return (data_len, data_repr) if prefix else data_repr
+
+	def _parse(self, line):
+		if isinstance(line, bytes): line = line.decode()
+		m = adict(line=line, params=list())
+		for k in '@tags', ':src':
+			pre, k = k[0], k[1:]
+			if line.startswith(pre):
+				try: m[k], line = line.split(' ', 1)
+				except ValueError:
+					raise IRCProtocolLineError(line) from None
+				line = line.lstrip(' ')
+			else: m[k] = None
+		while True:
+			if line.startswith(':'):
+				m.params.append(line[1:])
+				break
+			if ' ' in line:
+				param, line = line.split(' ', 1)
+				line = line.lstrip(' ')
+			else: param, line = line, ''
+			m.params.append(param)
+			if not line: break
+		if m.params: m.cmd, m.params = m.params[0].lower(), m.params[1:]
+		else: raise IRCProtocolLineError(line)
+		return m
+
+	def send(self, line_or_code, *args, max_len=None, auto_split=True):
+		line = line_or_code
+		if isinstance(line, int):
+			line = f':{self.bridge.server_host} {line:03d} {self.st.nick or "*"}'
+		if args: line += ' ' + ' '.join(map(str, args))
+		if isinstance(line, str): line = line.encode()
+		if max_len is None: max_len = self.conf.irc_len_hwm
+		line = line.rstrip(b'\r\n')
+		if b'\n' in line or len(line) > max_len:
+			if auto_split:
+				m = self._parse(line)
+				if m.cmd in ['privmsg', 'notice']: return self.send_split_msg(m)
+			if len(line) > max_len:
+				self.log.info('Sending line with >{}B: {!r}', max_len, self._repr(line))
+		if b'\n' in line: raise IRCProtocolError(f'Line with newlines: {line!r}')
+		line += b'\r\n'
+		self.data_send(line)
+
+	def send_split_msg(self, m):
+		dst, line = m.params
+		pre, max_len = f'{m.cmd.upper()} {dst}', self.conf.irc_len_lwm
+		if m.src: pre = f'{m.src} {pre}'
+		if '\n' in line:
+			for line in line.split('\n'): self.send(pre, f':{line.rstrip()}')
+			return
+		line, ws = '', re.findall(r'(\S+)(\s*)', line)
+		for w, sep in ws:
+			if line.strip() and len(line) + len(w) > max_len:
+				self.send(pre, f':{line.rstrip()}', auto_split=False)
+				line = sep_last
+			sep_last, line = sep, line + w + sep
+		if line.strip(): self.send(pre, f':{line.rstrip()}', auto_split=False)
+
+	async def recv_queue_proc(self):
+		try:
+			while True:
+				line = await self.recv_queue.get()
+				if line is StopIteration: break
+				try: await self.recv(line)
+				except Exception as err:
+					self.log.exception(f'Failed to parse line: {line}')
+		finally: self.recv_queue = None
+
+	async def recv(self, line_raw):
+		if isinstance(line_raw, str): line = line_raw
+		else:
+			try: line = line_raw.decode().strip()
+			except UnicodeDecodeError:
+				return self.log.error('Failed to decode line as utf-8: {!r}', self._repr(line_raw))
+		try: m = self._parse(line)
+		except IRCProtocolLineError:
+			return self.log.error('Line protocol error: {!r}', self._repr(line_raw))
+		cmd_cache = self._cmd_cache.get(m.cmd)
+		if cmd_cache: cmd_func, cmd_ps_n = cmd_cache
+		else:
+			cmd_func, cmd_ps_n = getattr(self, f'recv_cmd_{m.cmd}', None), 0
+			if cmd_func:
+				args = list(inspect.signature(cmd_func).parameters.values())
+				cmd_ps_n = len(args)
+				if cmd_ps_n == 1 and args[0].annotation == 'msg': cmd_ps_n = None
+				else: cmd_ps_n = cmd_ps_n - sum(1 for p in args if p.default is not p.empty), cmd_ps_n
+			self._cmd_cache[m.cmd] = cmd_func, cmd_ps_n
+		if not cmd_func:
+			self.log.error('Unhandled cmd: {!r}', self._repr(line_raw))
+			return self.send(421, ':Unknown command')
+		if not self.check_access(m.cmd):
+			return self.log.error('Out-of-order cmd: {!r}', self._repr(line_raw))
+		if cmd_ps_n is None: await aio_await_wrap(cmd_func(m))
+		else:
+			(a, b), n = cmd_ps_n, len(m.params)
+			if not a <= n <= b:
+				self.log.error( 'Command/args'
+					' mismatch [{} vs {}-{}]: {!r}', n, a, b, self._repr(line) )
+				return self.send(461, ':Incorrect command parameters')
+			try: await aio_await_wrap(cmd_func(*m.params))
+			except Exception as err:
+				self.send(400, m.cmd.upper(), f':BUG - Internal Error - {err_fmt(err)}')
+				self.log.exception('Error processing message: {}', m)
+
+	def check_access(self, cmd):
+		if self.st.cap_neg: return cmd in ['cap', 'quit']
+		if not self.st.auth:
+			res = cmd in ['cap', 'user', 'nick', 'pass', 'quit', 'ping']
+			if not res: self.send(451, ':You have not registered')
+			return res
+		res = cmd not in ['user', 'pass']
+		if not res: self.send(462, ':You may not reregister')
+		return res
+
+	# chan_spec=#some-channel, chan_name=lower(some-channel)
+	_csc = lambda c: c.startswith('#')
+	chan_spec_check = staticmethod(_csc)
+	chan_spec = staticmethod(
+		lambda name,_csc=_csc: name if _csc(name) else f'#{name}' )
+	chan_name = staticmethod(
+		lambda chan,_csc=_csc: (chan if not _csc(chan) else chan[1:]).lower() )
+
+
+	def recv_cmd_ping(self, server, server_dst=None):
+		self.send(f'PONG {self.bridge.server_host}')
+
+	def recv_cmd_cap(self, sub, caps=''):
+		sub = sub.lower()
+		if sub == 'ls':
+			self.send('CAP * LS :')
+			if caps == '302': self.st.cap_neg = True
+		elif sub == 'list': self.send('CAP * LIST :')
+		elif sub == 'req':
+			self.st.cap_neg = True
+			reject = set(c for c in caps.split() if not c.startswith('-'))
+			if reject: self.send(f'CAP * NAK :{caps}')
+			else: self.send(f'CAP * ACK :{caps}')
+		elif sub == 'end': self.st.cap_neg = False
+
+	def recv_cmd_pass(self, pw):
+		self.st.pw = pw
+		self.check_auth_done()
+	def recv_cmd_user(self, name, a, b, real_name):
+		self.st.update(user=name, real_name=real_name)
+		self.check_auth_done()
+	def recv_cmd_nick(self, nick):
+		if not re.search(r'^[a-zA-Z-._]+$', nick):
+			return self.send(432, nick, ':Erroneus nickname')
+		if self.bridge.cmd_conn(nick):
+			return self.send(433, nick, ':Nickname is already in use')
+		self.st.nick = nick
+		if self.st.auth and self.st.nick:
+			self.send(f':{self.st.nick} NICK {nick}')
+		self.check_auth_done()
+
+	def check_auth_done(self):
+		# Delay is to avoid trivial bruteforcing
+		self.bridge.cmd_delay('irc_auth', self.check_auth_done_delayed)
+
+	def check_auth_done_delayed(self):
+		if self.st.auth: return
+		if not (self.st.nick and self.st.user): return
+		if self.st.pw_hash:
+			salt, pw_hash = self.st.pw_hash
+			if not secrets.compare_digest( pw_hash,
+					hashlib.blake2b((self.st.pw or '').encode(), salt=salt).digest() ):
+				return self.send(464, ':Password incorrect')
+		self.st.auth = True
+		self.send('NOTICE * :*** registration completed')
+		self.send(1, f':Welcome to the kelp ircd, {self.st.nick}')
+		self.send(2,
+			f':Your host is {self.bridge.server_host},'
+			f' running kelp {self.bridge.server_ver}' )
+		self.send(3, ':This server was created at {}'.format(
+			self.bridge.server_ts.strftime('%Y-%m-%d %H:%M:%S UTC') ))
+		self.send(4, f'{self.bridge.server_host} kelp-{self.bridge.server_ver} {self.feats_modes}')
+		self.send_feats()
+		self.send_stats()
+		self.send_motd()
+
+	def send_feats(self, msg_feats_max=10, msg_len_max=200):
+		feat_line, ext = list(), ':are supported by this server'
+		for feat in it.chain(self.feats_support, [None]):
+			if feat: feat_line.append(feat)
+			n, msg_len = len(feat_line), sum((len(f)+1) for f in feat_line)
+			if feat_line and (not feat or n >= msg_feats_max or msg_len >= msg_len_max):
+				self.send(5, ' '.join(feat_line), ext)
+				feat_line.clear()
+
+	def send_stats(self):
+		s = self.bridge.irc_conn_stats()
+		self.send(251, f':There are {s.auth} users and 0 invisible on {s.servers} server(s)')
+		self.send(252, f'{s.op} :IRC Operators online')
+		self.send(253, f'{s.unknown} :unknown connection(s)')
+		self.send(254, f'{s.chans} :channels formed')
+		self.send(255, f':I have {s.total} client(s) and {s.servers} server(s)')
+		self.send( 265, f'{s.total} {s.total_max}',
+			f':Current local users {s.total}, max {s.total_max}' )
+		self.send( 266, f'{s.total} {s.total_max}',
+			f':Current global users {s.total}, max {s.total_max}' )
+
+	def send_motd(self): self.send(422, ':MOTD File is missing')
+
+	def recv_cmd_quit(self, reason=None):
+		self.send('QUIT :Client quit')
+		self.send('ERROR :Closing connection (client quit)')
+		self.transport.close()
+
+	def req_chan_info(self, chan, cm=None, check=True):
+		if not self.chan_spec_check(chan):
+			return self.send(403, chan, ':No such channel')
+		if not cm: cm = self.bridge.cmd_chan_map()
+		c = cm.get(self.chan_name(chan))
+		if c: return c
+		if check: self.send(403, chan, ':No such channel')
+
+	def recv_cmd_join(self, chan, key=None):
+		if chan == '0': return self.recv_cmd_part(','.join(self.st.chans.values()))
+		chan_list, chan_map = chan.split(','), self.bridge.cmd_chan_map()
+		for chan in chan_list:
+			c = self.req_chan_info(chan, cm=chan_map, check=False)
+			name = c.name if c else self.chan_name(chan)
+			self.send(f':{self.st.nick} JOIN {chan}')
+			self.send_topic(chan, c=c)
+			self.send_names(chan, own=True, c=c)
+			self.send(f'MODE {chan} +v {self.st.nick}')
+			self.st.chans.add(name)
+
+	def recv_cmd_part(self, chan, reason=None):
+		chan_list, chan_map = chan.split(','), self.bridge.cmd_chan_map()
+		for chan in chan_list:
+			c = self.req_chan_info(chan, cm=chan_map, check=False)
+			name = c.name if c else self.chan_name(chan)
+			if name not in self.st.chans:
+				self.send(442, chan, ':You are not on that channel')
+			else:
+				self.st.chans.remove(name)
+				self.send(f':{self.st.nick} PART {chan}')
+
+	async def recv_cmd_topic(self, chan, topic=None):
+		if not self.chan_spec_check(chan):
+			return self.send(403, chan, ':No such channel')
+		if not topic:
+			self.send_topic(chan)
+			return await self.bridge.irc_topic_cmd(self, chan)
+		try: await self.bridge.irc_topic_cmd(self, chan, topic)
+		except IRCBridgeSignal as err: self.send(482, chan, f':{err}')
+
+	def send_topic(self, chan, c=...):
+		if c is ...: c = self.req_chan_info(chan)
+		if not (c and c.topic): self.send(331, chan, ':No topic is set')
+		else:
+			topic = str_repr(c.topic, max_len=self.conf.irc_len_topic, len_bytes=True)
+			self.send(332, chan, f':{topic}')
+			topic_src = c.get('topic_src')
+			if topic_src: self.send(333, chan, topic_src.nick, int(topic_src.ts))
+
+	def recv_cmd_names(self, chan):
+		chan_list = chan.split(',')
+		for chan in chan_list: self.send_names(chan)
+
+	def send_names(self, chan, own=False, c=..., msg_len_max=200):
+		if c is ...: c = self.req_chan_info(chan)
+		name_line, names = list(), filter( None,
+			self.bridge.cmd_chan_names(c.name) ) if c else list()
+		for name in it.chain(names, [None]):
+			if name:
+				if irc_name_eq(name, self.st.nick): own = False
+				name_line.append(name)
+			elif own: name_line.append(self.st.nick)
+			if name_line and (
+					not name or sum(len(n)+1 for n in name_line) > msg_len_max ):
+				self.send(353, '=', chan, ':' + ' '.join(name_line))
+				name_line.clear()
+		self.send(366, chan, ':End of /NAMES list')
+
+	def recv_cmd_mode(self, target, mode=None, mode_args=None):
+		if self.chan_spec_check(target):
+			chan = target
+			c = self.req_chan_info(chan, check=False)
+			if self.conf.irc_chan_modes: self.send(324, chan, '+cnrt')
+			if c: chan_ts = int(c.ts_created)
+			else:
+				if self.chan_name(chan) not in self.st.chans:
+					return self.send(403, chan, ':No such channel')
+				chan_ts = int(time.time())
+			if self.conf.irc_chan_modes: self.send(329, chan, chan_ts)
+		else:
+			if not irc_name_eq(target, self.st.nick):
+				return self.send(502, ':No access to modes of other users')
+			self.send(221, ':+w')
+
+	def recv_cmd_away(self, msg=None):
+		self.st.away = msg or None
+		if self.st.away: self.send(306, ':You have been marked as being away')
+		else: self.send(305, ':You are no longer marked as being away')
+
+	def recv_cmd_list(self, chan=None, cond=None):
+		self.send(321, 'Channel :Users  Name')
+		for c in self.bridge.cmd_chan_map().values():
+			names = self.bridge.cmd_chan_names(c.name)
+			topic = str_repr(c.topic, max_len=self.conf.irc_len_topic, len_bytes=True)
+			self.send(322, self.chan_spec(c.name), len(names), f':{topic}')
+		self.send(321, ':End of /LIST')
+
+	def recv_cmd_motd(self, target=None): self.send_motd()
+
+	def recv_cmd_version(self, target=None):
+		self.send(351, self.bridge.server_ver, 'kelp', ':kelp ircd')
+		self.send_feats()
+
+	def recv_cmd_privmsg(self, target, text):
+		self.cmd_msg(self.st.nick, target, text, skip_self=True)
+
+	def recv_cmd_notice(self, target, text):
+		self.cmd_msg(self.st.nick, target, text, notice=True, skip_self=True)
+
+	def cmd_msg(self, src, target, text, notice=False, skip_self=False, msg_type=None):
+		if not msg_type: msg_type = 'PRIVMSG' if not notice else 'NOTICE'
+		if self.chan_spec_check(target):
+			chan, name = target, self.chan_name(target)
+			if not notice: c = self.req_chan_info(chan)
+			else: c = self.bridge.cmd_chan_map().get(name)
+			if not c: return
+			for conn in self.bridge.cmd_chan_conns(name):
+				if skip_self and conn is self: continue
+				conn.send(f':{src} {msg_type} {chan} :{text}')
+			if not notice: self.bridge.irc_msg(self, chan, text)
+		else:
+			conn = self.bridge.cmd_conn(target)
+			if not conn:
+				if not notice: self.send(401, target, ':No such nick/channel')
+			else: conn.send(f':{src} {msg_type} {target} :{text}')
+
+	def cmd_msg_synth(self, src, target, text, notice=False, direct=False):
+		'''Synthetic PRIVMSG which avoids any self-reaction loops like notices
+			Channel target must be prefixed by #. direct=True msg only goes to self.'''
+		msg_type = 'PRIVMSG' if not notice else 'NOTICE'
+		if direct: return self.send(f':{src} {msg_type} {target} :{text}')
+		self.cmd_msg(src, target, text, notice=True, msg_type=msg_type)
+
+	def cmd_msg_self(self, src, text, notice=True):
+		msg_type = 'PRIVMSG' if not notice else 'NOTICE'
+		self.send(f':{src} {msg_type} {self.st.nick} :{text}')
+
+	# Some of following user/server/channel-info cmds
+	#  can be (ab)used to provide discord user/channel info.
+	# Currently this isn't stored or queried anywhere,
+	#  so no need for these beyond stubs for what ZNC and such use.
+
+	def recv_cmd_userhost(self, nick):
+		if irc_name_eq(nick, self.st.nick):
+			self.send(302, f':{nick}=+~{self.st.user}@{self.st.host}')
+		else: self.send(401, nick, ':No such nick/channel')
+
+	def recv_cmd_who(self, name):
+		if re.search(r'^[#@%]\d+$', name):
+			self.bridge.cmd_delay(self.bridge.cmd_info(self, name[0], name[1:]))
+		else:
+			conn = self.bridge.cmd_conn_map().get(name)
+			if conn:
+				self.send( 352, '*', conn.st.user, conn.st.host,
+					self.bridge.server_host,conn.st.nick, 'H', f':0 {conn.st.nick}' )
+		self.send(315, name, ':End of /WHO list.')
+
+	# recv_cmd_whois
+	# recv_cmd_whowas
+	# recv_cmd_admin
+	# recv_cmd_time
+	# recv_cmd_stats
+	# recv_cmd_info
+
+
+
+class Kelp:
+
+	class c:
+		chan_control = 'control'
+		chan_debug = 'debug'
+		chan_monitor = 'monitor'
+
+	def __init__(self, loop, conf):
+		self.loop, self.conf, self.init = loop, conf, None
+		self.log = get_logger('kelp.bridge')
+		self._repr = ft.partial(str_repr, max_len=self.conf.debug_msg_cut)
+
+	async def __aenter__(self):
+		self.server_ver = self.conf.version
+		self.server_ts = dt.datetime.utcnow()
+		self.server_host = os.uname().nodename
+		self.irc_conns, self.irc_conns_max = adict(), 0
+		self.irc_auth_tbf = token_bucket(self.conf.irc_auth_tbf)
+		self.nick_sys, self.chans_sys = 'core', {
+			self.c.chan_control: 'kelp: control channel, type "help" for more info',
+			self.c.chan_debug: 'kelp: debug logging channel, type "help" for more info',
+			self.c.chan_monitor: 'kelp: read-only catch-all channel with messages from everywhere' }
+		self.tasks = StacklessContext(self.log)
+		self.cache = adict(uid=dict())
+		self.uid_len, self.uid_seed = (self.conf.get(f'irc_uid_{k}') for k in ['len', 'seed'])
+		if not self.uid_seed:
+			for k in '/etc/machine-id', '/var/lib/dbus/machine-id':
+				try: self.uid_seed = str_hash(pl.Path(k).read_text().strip())
+				except OSError: continue
+			else: self.uid_seed = f'kelp.{self.server_host}'
+		boot_id = pl.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+		self.uid_start = '.'.join( str_hash(v, c)
+			for c, v in zip([3, 3, 6], [self.uid_seed, boot_id, os.urandom(6)]) )
+		self.init = True
+		return self
+
+	async def __aexit__(self, *err):
+		if self.tasks: await self.tasks.close()
+		self.init = False
+
+	async def run(self):
+		ircd = await self.loop.create_server(
+			IRCProtocol.factory_for_bridge(self),
+			self.conf.irc_host, self.conf.irc_port,
+			family=self.conf.irc_host_af, start_serving=False )
+		### Other asyncio things should be initialized and started here
+		ircd_task = self.tasks.add(ircd.serve_forever())
+		self.log.debug('Starting ircd...')
+		await ircd_task
+		self.log.debug('Finished')
+
+	async def run_async(self):
+		async with self: await self.run()
+
+
+	def irc_conn_new(self, irc):
+		self.irc_conns[id(irc)] = irc
+		self.irc_conns_max = max(self.irc_conns_max, len(self.irc_conns))
+	def irc_conn_lost(self, irc): self.irc_conns.pop(id(irc), None)
+	def irc_conn_stats(self):
+		stats = adict(
+			servers=1, # XXX: count running services
+			chans=len(self.cmd_chan_map()), # XXX
+			total=0, total_max=self.irc_conns_max, unknown=0, auth=0, op=0 )
+		for conn in self.irc_conns.values():
+			stats.total += 1
+			if conn.st.auth: stats.auth += 1
+			else: stats.unknown += 1
+		return stats
+	def irc_conn_names(self):
+		for conn in self.irc_conns.values():
+			if conn.st.auth: yield conn.st.nick
+
+	def irc_msg(self, conn, chan, line):
+		name = conn.chan_name(chan)
+		if name in self.chans_sys:
+			return self.cmd_chan_sys(name, conn, chan, line)
+		if not line.strip(): return
+		conn.cmd_msg_synth( self.nick_sys, chan,
+			f'ERR {{no-recv-implemented}}: {line}', notice=True, direct=True )
+
+
+	def cmd_delay(self, delay, func=None):
+		if func is None: delay, func = 0, delay
+		if delay and not isinstance(delay, (int, float)):
+			if delay == 'irc_auth': delay = next(self.irc_auth_tbf)
+			else: raise ValueError(delay)
+		if delay: self.tasks.add(asyncio.sleep(delay), func)
+		else: self.tasks.add(aio_await_wrap(func))
+
+	def cmd_conn_map(self):
+		return irc_name_dict( (conn.st.nick, conn)
+			for conn in self.irc_conns.values() if conn.st.nick )
+
+	def cmd_conn(self, name=None):
+		try:
+			if not name: return next(iter(self.irc_conns.values()))
+			return self.cmd_conn_map()[name]
+		except (KeyError, StopIteration): return
+
+	def cmd_chan_conns(self, name):
+		return list(
+			conn for conn in self.irc_conns.values()
+			if conn.chan_name(name) in conn.st.chans )
+
+	def cmd_chan_names(self, name):
+		'Returns persistent mutable list of names for specified channel.'
+		# XXX: also list names from non-irc conns - bots and such
+		conn_nicks = irc_name_dict.value_map(
+			conn.st.nick for conn in self.cmd_chan_conns(name) )
+		return sorted(conn_nicks.values())
+
+	def cmd_chan_map(self):
+	 # XXX: also list bot/service channels here
+		return adict(
+			(name, adict( name=name,
+				topic=topic, ts_created=self.server_ts.timestamp() ))
+			for name, topic in self.chans_sys.items() )
+
+
+	def cmd_chan_sys(self, name, conn, chan, line):
+		cmd_func = getattr(self, f'cmd_chan_sys_{name}', None)
+		if cmd_func: cmd_func(conn, chan, line)
+
+	def cmd_chan_sys_log_counts(self):
+		counts = self.conf._debug_counts
+		counts = (' '.join( '{}={:,d}'.format(k, counts[k]) for n, k in
+			sorted(((n, k.lower()) for n, k in logging._levelToName.items()), reverse=True)
+			if counts[k] > 0 ) + f' all={counts["all"]:,d}').strip()
+		return counts
+
+	def cmd_chan_sys_control_status(self, send):
+		send('\n'.join([ 'Status:',
+			# XXX: service/bot states here
+			f'  log-msg-counts: {self.cmd_chan_sys_log_counts()}' ]))
+
+	def cmd_chan_sys_control(self, conn, chan, line):
+		line = line.strip().lower().split()
+		if not line: return
+		cmd, send = line[0],\
+			ft.partial(conn.cmd_msg_synth, self.nick_sys, chan)
+		if cmd in ['h', 'help']:
+			self.cmd_chan_sys_control_status(send)
+			send('\n'.join([
+				'Commands:',
+				'  status - (alias: st) show whether discord is connected and working',
+				'  connect - (alias: on) connect/login to discord',
+				'  disconnect - (alias: off) disconnect from discord',
+				'Only immediate response to sent commands is logged here - no noise over time.' ]))
+		elif cmd in ['status', 'st']: self.cmd_chan_sys_control_status(send)
+		elif cmd in ['connect', 'on']:
+			send('discord: connection started')
+			self.discord.connect()
+		elif cmd in ['disconnect', 'off']:
+			send('discord: disconnecting')
+			self.discord.disconnect()
+
+	def cmd_chan_sys_debug(self, conn, chan, line):
+		line_src, line = line, line.strip().lower().split()
+		pt_n, pt_cut = (getattr(self.conf, f'debug_chan_proto_{k}') for k in ['tail', 'cut'])
+		if not line: return
+		send = ft.partial(conn.cmd_msg_synth, self.nick_sys, chan)
+		if line[0] in ['h', 'help', 'st', 'status']:
+			level = proto_log_info = '???'
+			proto_log_shared = ['no', 'yes'][bool(log_proto_root.propagate)]
+			if self.conf._debug_chan:
+				level = logging.getLevelName(self.conf._debug_chan.level).lower()
+			if self.conf._debug_proto:
+				proto_log_info = logging.getLevelName(self.conf._debug_proto.level).lower()
+				proto_log_info = ( 'disabled' if proto_log_info == 'warning'
+					else f'enabled, file={self.conf._debug_proto.get_file()}' )
+			return send('\n'.join(f'-- {line}' for line in [
+				'This channel is for logging output, with level=warning by default,',
+				'  unless --debug is specified on command line, or [debug] verbose=yes in ini.',
+				f'Status:',
+				f'  log level: {level}',
+				f'  log msg counts: {self.cmd_chan_sys_log_counts()}',
+				f'  protocol log: {proto_log_info}',
+				f'  protocol log shared: {proto_log_shared}',
+				'Recognized commands here:',
+				'  level warning - (alias: w) only dump warnings and errors here',
+				'  level info - (alias: i) set level=info (default) logging in this channel',
+				'    That mostly adds connection stuff - disconnects, reconnects, auth, etc.',
+				'  level debug - (alias: d) enable level=debug logging in this channel',
+				'    Includes protocol info (if shared), events, messages and everything else.',
+				'  proto {file} - enable irc/discord protocol logging to specified file',
+				'  proto off - (alias: px) disable irc/discord protocol logging',
+				'  proto share/unshare - (alias: ps/pu)',
+				'    whether to dump protocol logging (level=debug) to regular logs',
+				f'  proto tail [n] [cut] - (alias: pt) dump "n" (default={pt_n}) tail lines',
+				f'    of protocol log file (if enabled), limited to "cut" length (default={pt_cut}).' ]))
+		with contextlib.suppress(KeyError):
+			line = dict(
+				i='level info', d='level debug', w='level warning',
+				px='proto off', ps='proto share',
+				pu='proto unshare', pt='proto tail' )[line[0]].split() + line[1:]
+		cmd, arg = line[0], line[1] if len(line) >= 2 else None
+		if cmd == 'level' and len(line) == 2:
+			level = getattr(logging, arg.upper(), None)
+			if level is not None and self.conf._debug_chan:
+				self.conf._debug_chan.setLevel(level)
+			else: arg = 'unavailable'
+			send(f'-- logging level: {arg}')
+		elif cmd == 'proto':
+			if arg == 'off':
+				if self.conf._debug_proto:
+					self.conf._debug_proto.setLevel(logging.WARNING)
+				else: arg = 'unavailable'
+				send(f'-- protocol log: {arg}')
+			elif arg in ['share', 'unshare']:
+				share = arg == 'share'
+				send(f'-- protocol log shared: {str(share).lower()}')
+				log_proto_root.propagate = share
+			elif arg == 'tail':
+				if not self.conf._debug_proto: send(f'-- protocol log disabled, nothing to show')
+				else:
+					if len(line) > 2: pt_n = int(line[2])
+					if len(line) > 3: pt_cut = int(line[3])
+					lines = file_tail(self.conf._debug_proto.get_file(), pt_n)
+					send(f'-- protocol log tail [{len(lines)}/{pt_n}:{pt_cut}]:')
+					for line in lines: send(f'--- {str_repr(line, max_len=pt_cut)}')
+					send(f'-- protocol log tail end')
+			elif len(line) >= 2:
+				path = line_src.strip().split(None, 1)[-1] # preserve spaces and case
+				if self.conf._debug_proto:
+					self.conf._debug_proto.set_file(path)
+					self.conf._debug_proto.setLevel(logging.DEBUG)
+					arg = f'file={path}'
+				else: arg = 'unavailable'
+				send(f'-- protocol log: {arg}')
+
+	def cmd_log(self, line):
+		if not self.init: return
+		conn = self.cmd_conn()
+		if not conn: return
+		conn.cmd_msg_synth( self.nick_sys,
+			conn.chan_spec(self.c.chan_debug), line )
+
+	# async def cmd_info(self, conn, t, id_str):
+	# 	t = {'#': 'channels', '@': 'users', '%': 'guilds'}[t]
+	# 	info_url = f'{t}/{id_str}'
+	# 	info = await self.discord.cmd_info_dump(info_url)
+	# 	conn.cmd_msg_self(self.nick_sys, f'--- [{info_url}] info follows')
+	# 	conn.cmd_msg_self(self.nick_sys, info)
+	# 	conn.cmd_msg_self(self.nick_sys, f'--- [{info_url}] end')
+
+	# def cmd_msg_monitor(self, msg, conn=None, nick=None, pre='', notice=True):
+	# 	if not conn: conn = self.cmd_conn()
+	# 	if not conn: return
+	# 	lines, n = list(filter(None, msg.splitlines())), self.conf.irc_len_monitor_lines
+	# 	if len(lines) > n:
+	# 		lines_n, lines = len(lines), lines[:n]
+	# 		lines[-1] += f' ... [{len(lines)}/{lines_n} lines]'
+	# 	c, n = conn.chan_spec(self.c.chan_monitor), self.conf.irc_len_monitor
+	# 	nick = nick or self.nick_sys
+	# 	for s in lines:
+	# 		conn.cmd_msg_synth( nick, c,
+	# 			f'{pre}{str_repr(s, n, len_bytes=True)}', notice=notice )
+
+
+
+class KelpConfig(KelpConfigBase):
+
+	state_tracked, state, aliases = True, None, None
+	_state_section = _state_offsets = _state_file = _state_file_ts = None
+	_debug_chan = _debug_proto = _debug_counts = None
+
+	def __init__(self):
+		self.state, self.aliases = dict(), dict()
+		self.log = get_logger('kelp.state')
+
+	def __repr__(self): return repr(vars(self))
+	def get(self, *k): return getattr(self, '_'.join(k))
+	def set(self, k, v): setattr(self, k, v)
+
+	def read(self, func, section, k, conf_k=None):
+		if not conf_k: conf_k = f'{section}_{k}'.replace('-', '_')
+		for k in k, k.replace('-', '_'), k.replace('_', '-'):
+			try:
+				self.set(conf_k, func(section, k))
+				return True
+			except configparser.NoSectionError: pass
+			except configparser.NoOptionError: pass
+
+	def pprint(self, title=None, empty_vals=False):
+		cat, chk = None, re.compile(
+			'^({})_(.*)$'.format('|'.join(map(re.escape, self._conf_sections))) )
+		if title: print(f';; {title}')
+		for k in sorted(dir(self)):
+			m = chk.search(k)
+			if not m: continue
+			v = self.get(k)
+			if not empty_vals and not v: continue
+			cat_chk = m.group(1).replace('_', '-')
+			if cat_chk != cat:
+				cat = cat_chk
+				print(f'\n[{cat}]')
+			if isinstance(v, bool): v = ['no', 'yes'][v]
+			k = m.group(2).replace('_', '-')
+			print(f'{k} = {v}')
+		if self.aliases:
+			print('\n[aliases]')
+			for k, v in self.aliases.items(): print(f'{".".join(k)} = {v}')
+
+	def read_from_file(self, *conf_paths):
+		conf_file = configparser.ConfigParser(allow_no_value=True)
+		conf_file.optionxform = lambda k: k
+		conf_file.read(conf_paths)
+		self._conf_path = conf_paths[-1]
+		for k in self._conf_sections:
+			self.update_from_file_section(conf_file, section=k, prefix=f'{k}_')
+		self.read(conf_file.getboolean, 'state', 'tracked')
+		self._state_section = conf_file.has_section('state')
+		if self.state_tracked and self._state_section:
+			for k, v in conf_file['state'].items():
+				if k == 'tracked': continue
+				self.state[k] = parse_iso8601(v)
+		if conf_file.has_section('aliases'):
+			for k, v in conf_file['aliases'].items():
+				if '.' not in k: continue
+				self.aliases[tuple(k.lower().split('.', 1))] = v
+
+	def update_from_file_section(self, config, section='default', prefix=None):
+		section = section.replace('_', '-')
+		for k in dir(self):
+			if prefix:
+				if not k.startswith(prefix): continue
+				conf_k, k = k, k[len(prefix):]
+			elif k.startswith('_'): continue
+			else: conf_k = k
+			v = getattr(self, conf_k)
+			if isinstance(v, str): get_val = lambda *a: str(config.get(*a, raw=True))
+			elif isinstance(v, bool): get_val = config.getboolean
+			elif isinstance(v, int): get_val = lambda *a: int(re.sub(r'[ _]', '', config.get(*a)))
+			elif isinstance(v, float): get_val = lambda *a: float(config.get(*a))
+			else: continue # values with other types cannot be specified in config
+			self.read(get_val, section, k, conf_k)
+
+	def update_file_section(self, section, keys=None, path=None):
+		section = section.replace('_', '-')
+		if not path: path = self._conf_path
+		if isinstance(path, str): path = pl.Path(path)
+		sec_re, sec_k = re.compile(r'(?i)^\[\s*(\S+)\s*\]$'), str_norm(section)
+		sec_prefix = section.lower().replace('-', '_') + '_'
+		if not keys: keys = list(k for k in vars(self).keys() if k.startswith(sec_prefix))
+		if isinstance(keys, str): keys = keys.split()
+		if isinstance(keys, dict): keys = list(keys.items())
+		for n, k in enumerate(keys):
+			if isinstance(k, tuple): k, v = k
+			else: v = ...
+			k = k.replace('_', '-')
+			if not k.startswith(sec_prefix): k = sec_prefix + k
+			if v is ...: v = self.get(k)
+			k = k[len(sec_prefix):]
+			if isinstance(v, bool): v = ['no', 'yes'][v]
+			keys[n] = k, v, re.compile(r'(?i)^' + k.replace('-', '[-_]') + r'\s*=')
+		keys = dict((k, (v, rx)) for k, v, rx in keys)
+		with path.open() as src, safe_replacement(path) as dst:
+			lines, sec, sec_parse = list(), list(), False
+			for n, line in enumerate(src):
+				m, line = sec_re.search(line.strip()), line.rstrip()
+				if m:
+					k = str_norm(m.group(1))
+					if k == sec_k:
+						sec_parse = True
+						if sec: line = '' # drop duplicate headers
+					if k != sec_k: sec_parse = False
+				if sec_parse: sec.append(line)
+				else: lines.append(line)
+			while sec and not sec[-1]: sec.pop()
+			if not sec: sec.append(f'[{section}]')
+			if lines and lines[-1]: lines.append('')
+			for line in lines: dst.write(f'{line}\n')
+			for n, line in enumerate(sec):
+				for k, (v, rx) in keys.items():
+					if not rx.search(line): continue
+					if v is None: line = None
+					else: line, keys[k] = f'{k} = {v}', (None, rx)
+				if line is not None: dst.write(f'{line}\n')
+			for k, (v, rx) in keys.items():
+				if v is None: continue
+				dst.write(f'{k} = {v}\n')
+		self._state_source_flush()
+
+	### Timestamps in [state] section are updated in-place,
+	###  overwriting short timestamp values without tmp files.
+	### File should be safe to edit manually regardless, due to ctime checks.
+
+	def _state_source_flush(self):
+		self._state_file = self._state_offsets = None
+
+	def _state_source_get(self):
+		if self._state_file and self._state_file_ts:
+			try: ts = os.stat(self._state_file.name).st_ctime
+			except OSError: ts = None
+			if ts != self._state_file_ts: self._state_source_flush()
+		if not self._state_file: self._state_file = open(self._conf_path, 'rb+')
+		if self._state_offsets is None: self._state_offsets = self._state_offsets_read()
+		return self._state_file, self._state_offsets
+
+	def _state_offsets_read(self, section='state'):
+		section, src = section.replace('_', '-'), self._state_file
+		sec_re, sec_k = re.compile(r'(?i)^\[\s*(\S+)\s*\]$'), str_norm(section)
+		src.seek(0)
+		offsets, parse = dict(), False
+		val_re = re.compile(b'^\s*([\w\d]\S+)\s*=\s*(\S+)\s*$')
+		for line in iter(src.readline, b''):
+			m = sec_re.search(line.decode().strip())
+			if m:
+				k = str_norm(m.group(1))
+				if k == sec_k: parse = True
+				else: parse = False
+				continue
+			if parse:
+				m = val_re.search(line)
+				if not m: continue
+				k, v = m.group(1), m.group(2)
+				pos = src.tell() - len(line) + m.start(2)
+				offsets[k.decode()] = pos
+				# src.seek(pos)
+				# v_chk = src.read(len(v))
+				# assert v_chk == v, [pos, v_chk, v]
+				# src.readline()
+		return offsets
+
+	def state_get(self, k, t='last-msg'): return self.state.get(f'{t}.{k}')
+
+	def state_set(self, k, ts, t='last-msg', sync=False):
+		if not self.state_tracked: return
+		if not self._state_section: self.update_file_section('state', 'tracked')
+		k, v = f'{t}.{k}', ts_iso8601(ts)
+		if k not in self.state:
+			self.update_file_section('state', {k: v})
+			self.state[k] = ts
+			return self.state_cleanup()
+		if self.state[k] > ts: return
+		src, offsets = self._state_source_get()
+		n, v = offsets[k], v.encode()
+		src.seek(n)
+		parse_iso8601(src.read(len(v)).decode(), validate=True)
+		src.seek(n)
+		src.write(v)
+		src.flush()
+		if sync: os.fdatasync(src.fileno())
+		self.state[k], self._state_file_ts = ts, os.fstat(src.fileno()).st_ctime
+
+	def state_cleanup(self, keep_max=10):
+		keys = sorted((v,k) for k,v in self.state.items())
+		if len(keys) <= keep_max: return
+		src, offsets = self._state_source_get()
+		offsets = sorted( ((offsets[k], k) for v,k in
+			keys[:len(keys) - keep_max]), reverse=True )
+		with src, safe_replacement(src.name, 'wb') as dst:
+			src.seek(0)
+			for line in iter(src.readline, b''):
+				if offsets and offsets[-1][0] < src.tell():
+					n, k = offsets.pop()
+					del self.state[k]
+					continue
+				dst.write(line)
+		self._state_source_flush()
+
+
+def main(args=None, conf=None):
+	if not conf: conf = KelpConfig()
+
+	import argparse, textwrap
+	dedent = lambda text: (textwrap.dedent(text).strip('\n') + '\n').replace('\t', '  ')
+	text_fill = lambda s,w=100,ind='\t',ind_next=None,**k: textwrap.fill(
+		s, w, initial_indent=ind, subsequent_indent=ind if ind_next is None else ind_next, **k )
+	class SmartHelpFormatter(argparse.HelpFormatter):
+		def __init__(self, *args, **kws):
+			return super().__init__(*args, **kws, width=100)
+		def _fill_text(self, text, width, indent):
+			if '\n' not in text: return super()._fill_text(text, width, indent)
+			return ''.join( indent + line
+				for line in text.replace('\t', '  ').splitlines(keepends=True) )
+		def _split_lines(self, text, width):
+			return super()._split_lines(text, width)\
+				if '\n' not in text else dedent(text).splitlines()
+
+	parser = argparse.ArgumentParser(
+		formatter_class=SmartHelpFormatter,
+		description='Kelp irc daemon for hosting various asyncio services.')
+
+	group = parser.add_argument_group('Configuration file(s)')
+	group.add_argument('-c', '--conf',
+		metavar='file', action='append',
+		help=f'''
+			Path to configuration file to use.
+			It will get updated with state info ([state] section), so has to be writable.
+			Default: {conf._conf_path}''')
+	group.add_argument('--conf-dump', action='store_true',
+		help='Print all configuration settings, which will be used with'
+			' currently detected (and/or specified) configuration file(s), and exit.')
+	group.add_argument('--conf-dump-defaults', action='store_true',
+		help='Print all default settings, which would be used'
+			' if no configuration file(s) were overriding these, and exit.')
+	group.add_argument('--conf-dump-state', action='store_true',
+		help='Print "state" section from the config file.')
+
+	group = parser.add_argument_group('Interfaces')
+	group.add_argument('-i', '--irc-bind', metavar='host(:port)',
+		help=f'''
+			Address/host (to be resolved via gai) and port to bind IRC server to.
+			When specifying port after raw IPv6 address,
+				enclose the latter in [], for example - [::]:6667.
+			Default: {conf.irc_host}:{conf.irc_port} or whatever is in --conf file.''')
+
+	group = parser.add_argument_group('Logging and debug opts')
+	group.add_argument('-d', '--debug',
+		action='store_true', help='Verbose operation mode.')
+	group.add_argument('-t', '--proto-cut', type=int, metavar='n',
+		help='Truncate long strings in protocol dumps to specified length.'
+			' Set to <=0 to disable truncation (default).')
+	group.add_argument('-p', '--proto-log', metavar='file',
+		help='''
+			File to dump full non-truncated protocol logs to.
+			Max file size and rotation options can be configured via --conf file.''')
+	group.add_argument('-l', '--debug-log', metavar='file',
+		help='''
+			Separate file for debug-level logging, regardless of levels set elsewhere.
+			Max file size and rotation options can be configured via --conf file.''')
+
+	opts = parser.parse_args(sys.argv[1:] if args is None else args)
+
+	if opts.conf_dump_defaults:
+		conf.pprint('Default configuration options', empty_vals=True)
+		return
+
+	conf_user_paths = list(map(
+		os.path.expanduser, opts.conf or [conf._conf_path] ))
+	for n, p in enumerate(conf_user_paths):
+		mode = os.R_OK
+		if n == len(conf_user_paths) - 1: mode |= os.W_OK
+		if not os.access(p, mode):
+			parser.error(f'Specified config file missing or inaccessible: {p}')
+	conf.read_from_file(*conf_user_paths)
+
+	if opts.conf_dump:
+		conf.pprint('Current configuration options')
+		return
+	if opts.conf_dump_state:
+		print('state:')
+		for v, k in sorted((v,k) for k,v in conf.state.items()): print(f'  {k}: {v}')
+		return
+
+	if opts.debug: conf.debug_verbose = True
+	if opts.debug_log: conf.debug_log_file = opts.debug_log
+	if opts.proto_cut: conf.debug_proto_cut = opts.proto_cut
+	if opts.proto_log: conf.debug_proto_log_file = opts.proto_log
+
+	log_fmt = '{name} {levelname:5} :: {message}'
+	if conf.debug_verbose: log_fmt = '{asctime} :: ' + log_fmt
+	log_fmt = logging.Formatter(log_fmt, style='{')
+	log_handler = logging.StreamHandler(sys.stderr)
+	log_handler.setLevel( logging.DEBUG
+		if conf.debug_verbose else logging.WARNING )
+	log_handler.setFormatter(log_fmt)
+	log_handler.addFilter(log_empty_filter)
+	logging.root.addHandler(log_handler)
+	logging.root.setLevel(0)
+	log = get_logger('main')
+
+	log_handler = LogLevelCounter()
+	logging.root.addHandler(log_handler)
+	conf._debug_counts = log_handler.counts
+
+	if conf.debug_log_file:
+		log_handler = LogFileHandler(
+			conf.debug_log_file,
+			maxBytes=conf.debug_log_file_size,
+			backupCount=conf.debug_log_file_count )
+		log_handler.setLevel(logging.DEBUG)
+		log_handler.setFormatter(logging.Formatter(
+			'{asctime}.{msecs:03.0f} :: {name} {levelname:5} :: {message}',
+			datefmt='%Y-%m-%dT%H:%M:%S', style='{' ))
+		logging.root.addHandler(log_handler)
+
+	log_proto_root.propagate = conf.debug_proto_log_shared
+	log_handler = conf._debug_proto = LogFileHandler(
+		conf.debug_proto_log_file or '/dev/null',
+		maxBytes=conf.debug_proto_log_file_size,
+		backupCount=conf.debug_proto_log_file_count )
+	log_handler.setLevel( logging.DEBUG
+		if conf.debug_proto_log_file else logging.WARNING )
+	log_handler.setFormatter(LogProtoFormatter(
+		'%(asctime)s :: %(reltime)s :: %(name)s :: %(message)s' ))
+	log_handler.addFilter(log_proto_debug_filter)
+	log_proto_root.addHandler(log_handler)
+
+	def handle_exception(err_t, err, err_tb):
+		log.error('Unhandled error: {}', err_fmt(err), exc_info=(err_t, err, err_tb))
+	sys.excepthook = handle_exception
+
+	host, port, family = opts.irc_bind or conf.irc_host, conf.irc_port, conf.irc_host_af
+	if host.count(':') > 1: host, port = str_part(host, ']:>', port)
+	else: host, port = str_part(host, ':>', port)
+	if '[' in host: family = socket.AF_INET6
+	host, port = host.strip('[]'), int(port)
+	try:
+		addrinfo = socket.getaddrinfo( host, str(port),
+			family=family, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP )
+		if not addrinfo: raise socket.gaierror(f'No addrinfo for host: {host}')
+	except (socket.gaierror, socket.error) as err:
+		parser.error( 'Failed to resolve irc socket parameters (address, family)'
+			' via getaddrinfo: {!r} - [{}] {}'.format((host, port), err.__class__.__name__, err) )
+	sock_af, sock_t, sock_p, _, sock_addr = addrinfo[0]
+	log.debug(
+		'Resolved irc host:port {!r}:{!r} to endpoint: {} (family: {}, type: {}, proto: {})',
+		host, port, sock_addr, *(sockopt_resolve(pre, n)
+			for pre, n in [('af_', sock_af), ('sock_', sock_t), ('ipproto_', sock_p)]) )
+	assert ( sock_t == socket.SOCK_STREAM
+		and sock_p == socket.IPPROTO_TCP ), [sock_t, sock_p]
+	conf.irc_host_af, (conf.irc_host, conf.irc_port) = sock_af, sock_addr[:2]
+
+	log.debug('Starting eventloop...')
+	with contextlib.closing(asyncio.get_event_loop()) as loop:
+		# if conf.debug_verbose: loop.set_debug(True)
+		kelp = Kelp(loop, conf)
+
+		log_handler = conf._debug_chan = LogFuncHandler(kelp.cmd_log)
+		log_handler.setLevel(logging.DEBUG if conf.debug_verbose else logging.WARNING)
+		log_handler.setFormatter(logging.Formatter(
+			'{name} {levelname:5} :: {message}', style='{' ))
+		log_handler.addFilter(log_empty_filter)
+		log_handler.addFilter(log_proto_debug_filter)
+		logging.root.addHandler(log_handler)
+
+		kelp_task = loop.create_task(kelp.run_async())
+		for sig in 'INT TERM'.split():
+			loop.add_signal_handler(getattr(signal, f'SIG{sig}'), kelp_task.cancel)
+		with contextlib.suppress(asyncio.CancelledError):
+			return loop.run_until_complete(kelp_task)
+	log.debug('Finished')
+
+if __name__ == '__main__': sys.exit(main())
