@@ -1,6 +1,6 @@
-import os, sys, asyncio, socket, struct, binascii, time
+import os, sys, asyncio, socket, struct, binascii, hashlib, time
 
-err_fmt = lambda err: '[{}] {}'.format(err.__class__.__name__, err)
+import libnacl
 
 
 class UDPRSConf:
@@ -10,6 +10,10 @@ class UDPRSConf:
 	host_af = 0
 	recv_timeout = 5 * 60.0
 
+	cb_key = '' # must be specified
+	topic = 'udp-report-sink [{conf.host}:{conf.port}]'
+	nick = 'ursa'
+
 	### Single report is reassembed from frames with same uid
 	### Can have some bits masked to specific values to filter-out junk packets from logs
 	### Such filtering is not for security, just to avoid logging random internet noise
@@ -17,7 +21,10 @@ class UDPRSConf:
 	uid_mask_intervals = '3,9,7,6' # csv intervals to check bits at, last one repeated
 	uid_mask_bits = '--x--xx-x-' # bits at intervals to match, dash=0 x=1
 
-	# XXX: crypto parameters
+	# See also: udp-report-sink-chans mapping of chans to keys/topics.
+
+
+err_fmt = lambda err: '[{}] {}'.format(err.__class__.__name__, err)
 
 
 class UDPReportSink:
@@ -25,7 +32,10 @@ class UDPReportSink:
 	def __init__(self, iface):
 		self.loop, self.conf = ( iface.loop,
 			iface.read_conf_section('udp-report-sink', UDPRSConf) )
+		self.chan_keys = dict(iface.read_conf_section('udp-report-sink-keys').items())
 		self.iface, self.log = iface, iface.get_logger('udprs')
+		if not self.conf.cb_key:
+			raise ValueError('Local CryptoBox Seed value must be specified in config file')
 
 	async def __aenter__(self):
 		self.pkt_header = struct.Struct(f'>{self.conf.uid_len}sH')
@@ -46,10 +56,26 @@ class UDPReportSink:
 			mask_val += (s == 'x') * v
 		if mask_val & mask != mask_val: raise RuntimeError
 		self.uid_match = lambda uid: int.from_bytes(uid, 'big') & mask == mask_val
+		self.log.debug('uid-mask={:x} uid-mask-val={:x}', mask, mask_val)
 
 		self.frags = dict()
 		self.conn_id = self.iface.lib.str_hash(os.urandom(8), 3, key='udprs-1')
 		self.log_proto = self.iface.get_logger('udprs', proto=True)
+
+		b64dec, b64enc = self.iface.lib.b64_decode, self.iface.lib.b64_encode
+		chan_map, self.chan_names = dict(), dict()
+		topic_base = self.conf.topic.format(conf=self.conf)
+		for k, v in sorted(self.chan_keys.items(), key=lambda kv: len(kv[0])):
+			if k.endswith('-topic'): chan_map[k[:-6]] = self.chan_keys.pop(k)
+			elif k.endswith('-nick'): self.chan_names[k[:-5]] = self.chan_keys.pop(k)
+			else:
+				chan_map[k], self.chan_names[k] = topic_base, self.conf.nick
+				for pk in self.chan_keys.pop(k).split(): self.chan_keys[b64dec(pk)] = k
+		self.iface.reg_chan_map_func(lambda: chan_map)
+		for chan, nick in self.chan_names.items(): self.iface.reg_name(chan, nick)
+
+		self.pk, self.sk = libnacl.crypto_box_seed_keypair(b64dec(self.conf.cb_key))
+		self.log.debug('Local crypto_box pubkey: {}', b64enc(self.pk))
 
 		sock_t, sock_p, self.conf.host_af, self.conf.host, self.conf.port = \
 			self.iface.lib.gai_bind('udp', self.conf.host, self.conf.port, self.conf.host_af, self.log)
@@ -80,16 +106,17 @@ class UDPReportSink:
 
 		# Cleanup
 		ts_cutoff = time.monotonic() - self.conf.recv_timeout
-		for uid, entry in list(self.frags.items()):
+		for uid_chk, entry in list(self.frags.items()):
 			if entry.ts > ts_cutoff: break
-			self.frags.pop(uid)
+			self.frags.pop(uid_chk)
 
 		# Fragment processing
-		seq, final = int.from_bytes(seq, 'big'), False
 		if seq & 0x8000: final, seq = True, seq - 0x8000
+		else: final = False
 		addr_str, uid_str = ':'.join(map(str, addr[:2])), binascii.b2a_hex(uid).decode()
-		self.log_proto.debug('', extra=( '<< ',
-			f'{addr_str} :: {uid_str} :: {seq:02d} {" " if not final else "F"} {len(data)}' ))
+		mark, msg = ( '<< ',
+			f'{addr_str} :: {uid_str} :: {seq:02d} {" " if not final else "F"} {len(data)}' )
+		self.log_proto.debug(f'{mark} {msg}', extra=(mark, msg))
 		if uid not in self.frags:
 			self.frags[uid] = self.iface.lib.adict(c=None, ts=time.monotonic())
 		entry = self.frags[uid]
@@ -105,16 +132,27 @@ class UDPReportSink:
 		buff = b''.join(buff)
 
 		# Decrypt/auth/parse and ack
-		if self.parse(addr_str, uid_str, buff): self.send_ack(uid, addr)
+		# XXX: receive heartbeats and track hb-interval info, check remote error counter there
+		pk = self.parse(addr_str, uid_str, buff)
+		if pk: self.send_ack(addr_str, uid_str, pk, uid, addr)
 
 	def parse(self, addr_str, uid_str, buff):
-		# XXX: decryption here
-		print(f'------- msg from={addr_str} uid={uid_str} buff-len={len(buff)}')
+		nonce, buff = buff[:24], buff[24:]
+		for pk, chan in self.chan_keys.items():
+			try: lines = libnacl.crypto_box_open(buff, nonce, pk, self.sk)
+			except libnacl.CryptError: continue
+			self.iface.send_msg(chan, self.chan_names[chan], lines)
+			return pk
+		else:
+			self.log.error( 'No key to decode msg:'
+				' addr={} uid={} len={}', addr_str, uid_str, len(buff) )
 
-	def send_ack(self, uid, addr):
-		# XXX: sign uid + nonce here
-		print(f'------- ack to={addr} uid={uid}')
-		# self.transport.sendto(uid, addr)
+	def send_ack(self, addr_str, uid_str, pk, uid, addr):
+		nonce = os.urandom(24)
+		buff = nonce + libnacl.crypto_box(uid, nonce, pk, self.sk)
+		mark, msg = ' >>', f'{addr_str} :: {uid_str} :: ack'
+		self.log_proto.debug(f'{mark} {msg}', extra=(mark, msg))
+		self.transport.sendto(buff, addr)
 
 
 # Any last assignment will be used as an entry point

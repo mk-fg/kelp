@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import itertools as it, operator as op, functools as ft
-import os, sys, stat, re, time, secrets, json
+import os, sys, stat, re, time, secrets, json, enum
 import contextlib, asyncio, socket, signal, inspect, traceback
 import hashlib, base64, unicodedata, configparser, tempfile
 import collections as cs, collections.abc as cs_abc, datetime as dt, pathlib as pl
@@ -27,7 +27,7 @@ class KelpConfigBase:
 	irc_len_monitor = 350 # to tuncate long lines in #monitor
 	irc_len_monitor_lines = 4 # to tuncate multiline msgs in #monitor
 
-	irc_uid_len = 4 # can be increased to fix conflicts
+	irc_uid_len = 4 # uid for blades, can be increased to fix conflicts
 	irc_uid_seed = ''
 	irc_chan_modes = False # causes needless spam on ZNC reconnects
 
@@ -133,47 +133,9 @@ log_bak = get_logger('fallback')
 log_proto_root = logging.getLogger('proto')
 
 
-def setup_aiohttp_trace_logging(log):
-	tc = aiohttp.TraceConfig()
-
-	@contextlib.contextmanager
-	def log_req(part, ident=None, t='req'):
-		if not log.isEnabledFor(logging.DEBUG): return
-		try:
-			dt = ' >>' if t == 'req' else '<< '
-			if ident: log.debug('', extra=(dt, f'{t} :: {ident}'))
-			log.debug('', extra=(dt, f'{t} :: {part} start'))
-			yield log
-			log.debug('', extra=(dt, f'{t} :: {part} end'))
-		except Exception as err:
-			err = err_fmt(err)
-			log.exception( 'Protocol logging failed: {}',
-				err, extra=('xxx', f'{t} :: {part} FAIL :: {err}') )
-
-	# This does not dump all req headers, but should be good enough
-	async def on_req_start(s, tc_ctx, ps):
-		tc_ctx.req_uid = str_hash(os.urandom(8))
-		with log_req('headers', f'[{tc_ctx.req_uid}] {ps.method} {ps.url}') as log:
-			for k, v in ps.headers.items(): log.debug('', extra=('  >', f'  {k}: {v}'))
-	tc.on_request_start.append(on_req_start)
-
-	async def on_req_chunk(s, tc_ctx, ps):
-		a = getattr(tc_ctx, 'pos', 0)
-		b = tc_ctx.pos = a + len(ps.chunk)
-		with log_req('body', f'[{tc_ctx.req_uid}] {a}-{b}') as log:
-			if ps.chunk: log.debug('', extra=('  >', ps.chunk))
-	tc.on_request_chunk_sent.append(on_req_chunk)
-
-	async def on_req_done(s, tc_ctx, ps):
-		res_info = ( '{0.status} {0.reason}'
-			' HTTP/{0.version.major}.{0.version.minor}' ).format(ps.response)
-		with log_req('headers', f'[{tc_ctx.req_uid}] {res_info}', 'res') as log:
-			for k, v in ps.response.headers.items(): log.debug('', extra=('<  ', f'  {k}: {v}'))
-		with log_req('body', f'[{tc_ctx.req_uid}]', 'res') as log:
-			log.debug('', extra=('<  ', await ps.response.read()))
-	tc.on_request_end.append(on_req_done)
-
-	return tc
+b64_encode = lambda s: base64.urlsafe_b64encode(s).decode()
+b64_decode = lambda s: ( base64.urlsafe_b64decode
+	if '-' in s or '_' in s else base64.standard_b64decode )(s)
 
 def sockopt_resolve(prefix, v):
 	prefix = prefix.upper()
@@ -234,9 +196,9 @@ def gai_bind(proto, bind, port='', family=0, log=None):
 
 
 def str_hash(s, c=None, key='kelp-1'):
-	s = base64.urlsafe_b64encode(
+	s = b64_encode(
 			hashlib.blake2s(str(s).encode(), key=key.encode()).digest() )\
-		.decode().replace('-', '').replace('_', '').replace('=', '')
+		.replace('-', '').replace('_', '').replace('=', '')
 	if c is None: return s
 	if len(s) < c: s = str_hash(s, c, key)
 	return s[:c]
@@ -405,6 +367,7 @@ class irc_name_dict(cs.UserDict):
 		lambda cls, names: cls((v, v) for v in names) )
 	def add(self, name): self[name] = name
 	def remove(self, name): del self[name]
+	def discard(self, name): self.pop(name, None)
 	def __contains__(self, key): return key.lower() in self.data
 	def __getitem__(self, k): return self.data[k.lower()]
 	def __setitem__(self, k, v): self.data[k.lower()] = v
@@ -856,16 +819,7 @@ class IRCProtocol:
 			self.send(302, f':{nick}=+~{self.st.user}@{self.st.host}')
 		else: self.send(401, nick, ':No such nick/channel')
 
-	def recv_cmd_who(self, name):
-		if re.search(r'^[#@%]\d+$', name):
-			self.bridge.cmd_delay(self.bridge.cmd_info(self, name[0], name[1:]))
-		else:
-			conn = self.bridge.cmd_conn_map().get(name)
-			if conn:
-				self.send( 352, '*', conn.st.user, conn.st.host,
-					self.bridge.server_host,conn.st.nick, 'H', f':0 {conn.st.nick}' )
-		self.send(315, name, ':End of /WHO list.')
-
+	# recv_cmd_who
 	# recv_cmd_whois
 	# recv_cmd_whowas
 	# recv_cmd_admin
@@ -883,7 +837,7 @@ class Kelp:
 		chan_monitor = 'monitor'
 
 	def __init__(self, loop, conf):
-		self.loop, self.conf, self.init = loop, conf, None
+		self.loop, self.conf, self.init, self.blades = loop, conf, None, list()
 		self.log = get_logger('kelp.bridge')
 		self._repr = ft.partial(str_repr, max_len=self.conf.debug_msg_cut)
 
@@ -915,9 +869,24 @@ class Kelp:
 		if self.tasks: await self.tasks.close()
 		self.init = False
 
+	def uid(self, k, v=None, kh=None, hash_len=None):
+		if v is None: return self.cache.uid.get(k, (None, None))
+		k = k, v
+		if k not in self.cache.uid:
+			if kh is None:
+				kh = str_hash( '\0'.join(map(str, k)),
+					hash_len or self.uid_len, self.uid_seed ).lower()
+				kh = self.conf.aliases.get((k[0], kh), kh)
+			if kh in self.cache.uid:
+				# Hash collisions should not happen here - raise uid_len if they do
+				raise ValueError(k, kh, self.cache.uid[kh])
+			self.cache.uid[k], self.cache.uid[kh] = kh, k
+		return self.cache.uid[k]
+
 	def add_blades(self, blades):
-		blade_iface = KelpBladeInterface(self)
-		self.blades = list(blade(blade_iface) for blade in blades)
+		self.blades.extend(
+			KelpBladeInterface(name, self, blade)
+			for name, blade in blades.items() )
 
 	async def run(self):
 		ircd = await self.loop.create_server(
@@ -987,18 +956,25 @@ class Kelp:
 			if conn.chan_name(name) in conn.st.chans )
 
 	def cmd_chan_names(self, name):
-		'Returns persistent mutable list of names for specified channel.'
-		# XXX: also list names from non-irc conns - bots and such
 		conn_nicks = irc_name_dict.value_map(
 			conn.st.nick for conn in self.cmd_chan_conns(name) )
+		for blade in self.blades:
+			if name not in blade._chan_names: continue
+			conn_nicks.update(blade._chan_names[name].items())
 		return sorted(conn_nicks.values())
 
 	def cmd_chan_map(self):
-	 # XXX: also list bot/service channels here
-		return adict(
+		ts_created = self.server_ts.timestamp()
+		chan_map = adict(
 			(name, adict( name=name,
-				topic=topic, ts_created=self.server_ts.timestamp() ))
+				topic=topic, ts_created=ts_created ))
 			for name, topic in self.chans_sys.items() )
+		for blade in self.blades:
+			if not blade._chan_map_func: continue
+			chan_map.update(
+				(name, adict(name=name, topic=topic, ts_created=ts_created))
+				for name, topic in blade._chan_map_func().items() )
+		return chan_map
 
 
 	def cmd_chan_sys(self, name, conn, chan, line):
@@ -1119,26 +1095,29 @@ class Kelp:
 		conn.cmd_msg_synth( self.nick_sys,
 			conn.chan_spec(self.c.chan_debug), line )
 
-	# async def cmd_info(self, conn, t, id_str):
-	# 	t = {'#': 'channels', '@': 'users', '%': 'guilds'}[t]
-	# 	info_url = f'{t}/{id_str}'
-	# 	info = await self.discord.cmd_info_dump(info_url)
-	# 	conn.cmd_msg_self(self.nick_sys, f'--- [{info_url}] info follows')
-	# 	conn.cmd_msg_self(self.nick_sys, info)
-	# 	conn.cmd_msg_self(self.nick_sys, f'--- [{info_url}] end')
+	def cmd_msg_monitor(self, msg, conn=None, nick=None, pre='', notice=True):
+		if not conn: conn = self.cmd_conn()
+		if not conn: return
+		lines, n = list(filter(None, msg.splitlines())), self.conf.irc_len_monitor_lines
+		if len(lines) > n:
+			lines_n, lines = len(lines), lines[:n]
+			lines[-1] += f' ... [{len(lines)}/{lines_n} lines]'
+		c, n = conn.chan_spec(self.c.chan_monitor), self.conf.irc_len_monitor
+		nick = nick or self.nick_sys
+		for s in lines:
+			conn.cmd_msg_synth( nick, c,
+				f'{pre}{str_repr(s, n, len_bytes=True)}', notice=notice )
 
-	# def cmd_msg_monitor(self, msg, conn=None, nick=None, pre='', notice=True):
-	# 	if not conn: conn = self.cmd_conn()
-	# 	if not conn: return
-	# 	lines, n = list(filter(None, msg.splitlines())), self.conf.irc_len_monitor_lines
-	# 	if len(lines) > n:
-	# 		lines_n, lines = len(lines), lines[:n]
-	# 		lines[-1] += f' ... [{len(lines)}/{lines_n} lines]'
-	# 	c, n = conn.chan_spec(self.c.chan_monitor), self.conf.irc_len_monitor
-	# 	nick = nick or self.nick_sys
-	# 	for s in lines:
-	# 		conn.cmd_msg_synth( nick, c,
-	# 			f'{pre}{str_repr(s, n, len_bytes=True)}', notice=notice )
+	def cmd_msg_blade(self, chan, nick, line, notice=False, conn=None):
+		direct, conn_list = bool(conn), [conn] if conn else self.cmd_chan_conns(chan)
+		if not conn: conn = conn_list[0] if conn_list else self.cmd_conn()
+		if not conn: return
+		if not direct:
+			self.cmd_msg_monitor( line, conn=conn,
+				nick=nick, pre=f'{chan} :: ', notice=notice )
+		for conn in conn_list:
+			conn.cmd_msg_synth( nick,
+				conn.chan_spec(chan), line, notice=notice, direct=True )
 
 
 
@@ -1348,23 +1327,72 @@ class KelpConfig(KelpConfigBase):
 
 
 class KelpBladeInterface:
+	# All underscored stuff here is for use by the bridge, while regular is for blades
 
-	lib = adict(adict=adict, str_hash=str_hash, gai_bind=gai_bind)
+	lib = adict(
+		adict=adict, str_hash=str_hash, gai_bind=gai_bind,
+		b64_encode=b64_encode, b64_decode=b64_decode )
+	act_t = enum.Enum('act_t', 'names msg topic')
 
-	def __init__(self, kelp):
-		self.loop, self.conf = kelp.loop, kelp.conf
+	def __init__(self, name, kelp, blade_init):
+		self.bridge, self.loop, self.conf = kelp, kelp.loop, kelp.conf
+		self.name, self.blade = name, blade_init(self)
+
+	async def __aenter__(self):
+		self._prefix = self.bridge.uid('blade', self.name)
+		self._chan_map_func = self._chan_act_func = None
+		self._chan_names = irc_name_dict()
+		await self.blade.__aenter__()
+		return self
+	async def __aexit__(self, *err):
+		await self.blade.__aexit__(*err)
+		self._chan_names = self._chan_map_func = self._chan_act_func = None
+
+	def _chan_name(self, chan): return f'{self._prefix}.{chan}'
 
 	def get_logger(self, name, proto=False):
+		'Ger prefixed logger for either general use or protocol messages.'
 		return get_logger( f'kelp.blade.{name}'
 			if not proto else f'proto.blade.{name}' )
 
-	def read_conf_section(self, section, conf):
+	def read_conf_section(self, section, conf=None):
+		'''Parse values according to passed conf object
+			from specified ini section or return raw parser mapping.'''
 		if isinstance(conf, type): conf = conf()
 		parser = configparser.ConfigParser(allow_no_value=True)
 		parser.optionxform = lambda k: k
 		parser.read(self.conf._conf_path_list)
-		KelpConfig.update_from_file_section(conf, parser, section)
-		return conf
+		if conf:
+			KelpConfig.update_from_file_section(conf, parser, section)
+			return conf
+		try: return parser[section]
+		except KeyError: return dict()
+
+	def reg_chan_map_func(self, chan_map_func):
+		'Register callable to return a {chan_name: topic, ...} dict.'
+		self._chan_map_func = lambda: dict(
+			(self._chan_name(chan), topic)
+			for chan, topic in chan_map_func().items() )
+
+	def reg_chan_activity_func(self, chan_act_func):
+		'Register callable to run as func(chan_name, act_t, nick, act) on any channel activity.'
+		raise NotImplementedError
+		self._chan_act_func = chan_act_func # chan_name should be processed/filtered
+
+	def reg_name(self, chan, nick, join=True):
+		'Register bot nick presence in the channel.'
+		chan = self._chan_name(chan)
+		if chan not in self._chan_names: self._chan_names[chan] = irc_name_dict()
+		chan = self._chan_names[chan]
+		# XXX: send JOIN/PART to all chan conns/bots
+		if join: chan.add(nick)
+		else: chan.discard(nick)
+
+	def send_msg(self, chan, nick, line, notice=False):
+		'Dispatch message/notice to specified channel from specified nick.'
+		chan = self._chan_name(chan)
+		self.bridge.cmd_msg_blade(chan, nick, line, notice=notice)
+
 
 
 
@@ -1506,22 +1534,23 @@ def main(args=None, conf=None):
 		blades_dir = pl.Path(conf.blades_dir)
 		if not blades_dir.exists():
 			parser.error(f'Configured blades-dir path does not exists: {blades_dir}')
-		for n, name in enumerate(blades):
+		blades, blades_list = dict(), blades
+		for name in blades_list:
 			blade_files = [name]
 			if not name.endswith('.py'): blade_files.append(name + '.py')
 			else: name = name[:-3]
-			name = '.'.join([blades_dir.name, name])
+			mod_name = '.'.join([blades_dir.name, name])
 			while blade_files:
 				blade = blades_dir / blade_files.pop()
 				if not blade.exists(): continue
-				log.debug('Loading blade [{}]: {}', name, blade)
-				blade = runpy.run_path(blade, run_name=name)
+				log.debug('Loading blade [{}]: {}', mod_name, blade)
+				blade = runpy.run_path(blade, run_name=mod_name)
 				try: ep_name, blade = list(blade.items())[-1]
-				except: parser.error(f'Blade missing init entry-point: {name}')
-				log.debug('Using entry-point [{}]: {}', name, ep_name)
+				except: parser.error(f'Blade missing init entry-point: {mod_name}')
+				log.debug('Using entry-point [{}]: {}', mod_name, ep_name)
 				break
 			else: blade = None
-			blades[n] = blade
+			blades[name] = blade
 
 	sock_t, sock_p, conf.irc_host_af, conf.irc_host, conf.irc_port = \
 		gai_bind('tcp', opts.irc_bind or conf.irc_host, conf.irc_port, conf.irc_host_af, log)
@@ -1539,7 +1568,7 @@ def main(args=None, conf=None):
 		log_handler.addFilter(log_proto_debug_filter)
 		logging.root.addHandler(log_handler)
 
-		kelp.add_blades(blades)
+		if blades: kelp.add_blades(blades)
 		kelp_task = loop.create_task(kelp.run_async())
 		for sig in 'INT TERM'.split():
 			loop.add_signal_handler(getattr(signal, f'SIG{sig}'), kelp_task.cancel)

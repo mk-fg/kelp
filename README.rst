@@ -67,19 +67,33 @@ See scripts in "blades" dir and KelpBladeInterface object for any implementation
 udp-report-sink
 ```````````````
 
-Plugin for receiving occasional usually-multiline log errors/warnings from
-remote sources to feed them into irc channel(s) as notifications.
+Plugin for receiving occasional usually-multiline log errors/warnings
+from remote sources to feed them into irc channel(s) as notifications,
+picking destination channel based on libnacl crypto_box key used for encryption.
 
 In addition logs missing heartbeats from remote, local/remote error counter
 jumps (e.g. due to failed delivery), does auth-encryption via pynacl, etc.
 
-For basic remote event logging, secure and reliable.
+Config sections:
+
+- udp-report-sink - see UDPRSConf.
+
+- udp-report-sink-chans - channel to source nacl crypto_box pubkeys mapping.
+
+  Each key is a channel name, values are space-separated crypto_box pubkeys for
+  all potential sources which will be dumped into this channel.
+
+  Special "{chan}-topic" and "{chan}-nick" keys can be used to specify
+  topic/nick for each channel, otherwise defauls from udp-report-sink will be used.
+
+See blades/udp-report-send-test.py for an example of simple sender script.
 
 
 Requirements
 ------------
 
 * `Python 3.7+ <http://python.org/>`_
+* [udp-report-sink] `libnacl <https://libnacl.readthedocs.io/en/latest/>`_
 
 
 Misc Features
