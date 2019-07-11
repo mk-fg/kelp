@@ -45,6 +45,37 @@ as well as server control channels (#control, #debug) and catch-all #monitor,
 see topics for more info on these.
 
 
+"blade" plugins
+---------------
+
+They are actual point of the whole thing.
+
+Enabled like this::
+
+  [blades]
+  enabled = udp-report-sink some-other-script
+
+Specified .py files loaded from ``dir =`` (default "blades") and last definition there
+is initialized as an async context manager, being passed KelpBladeInterface object.
+
+Each gets short base64 prefix for all channels it generates (based on name),
+and can use these (send-to, read, query names) separately from any other loaded blade-scripts.
+Can be configured via separate section(s) in the ini file(s).
+
+See scripts in "blades" dir and KelpBladeInterface object for any implementation details.
+
+udp-report-sink
+```````````````
+
+Plugin for receiving occasional usually-multiline log errors/warnings from
+remote sources to feed them into irc channel(s) as notifications.
+
+In addition logs missing heartbeats from remote, local/remote error counter
+jumps (e.g. due to failed delivery), does auth-encryption via pynacl, etc.
+
+For basic remote event logging, secure and reliable.
+
+
 Requirements
 ------------
 

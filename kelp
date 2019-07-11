@@ -12,6 +12,9 @@ class KelpConfigBase:
 
 	version = '1.97' # git-version: py-str
 
+	blades_dir = 'blades'
+	blades_enabled = ''
+
 	irc_host = '127.0.0.1'
 	irc_port = 6667
 	irc_password = ''
@@ -43,7 +46,7 @@ class KelpConfigBase:
 	debug_chan_proto_cut = 230
 
 	_conf_path = '~/.kelp.ini'
-	_conf_sections = 'irc', 'debug'
+	_conf_sections = 'blades', 'irc', 'debug'
 
 
 
@@ -201,6 +204,33 @@ def str_repr(s, max_len=50, len_bytes=False, prefix=False, ext=' ...[{s_len}]'):
 	return (s_len, s_repr) if prefix else s_repr
 
 irc_name_eq = lambda a, b: a.lower() == b.lower()
+
+def gai_bind(proto, bind, port='', family=0, log=None):
+	'''Run getaddrinfo() for common bind "host:port" resolution use-case.
+		Host overrides separate port argument, IPv6 detected from :: or sq-brackets.'''
+	if proto not in ['tcp', 'udp']: raise ValueError(proto)
+	host, sock_req = bind, (
+		(socket.SOCK_STREAM, socket.IPPROTO_TCP)
+		if 'tcp' else (socket.SOCK_DGRAM, socket.IPPROTO_UDP) )
+	if host.count(':') > 1: host, port = str_part(host, ']:>', port)
+	else: host, port = str_part(host, ':>', port)
+	if '[' in host: family = socket.AF_INET6
+	host, port = host.strip('[]'), int(port)
+	try:
+		addrinfo = socket.getaddrinfo( host, str(port),
+			family=family, type=sock_req[0], proto=sock_req[1] )
+		if not addrinfo: raise socket.gaierror(f'No addrinfo for host: {host}')
+	except (socket.gaierror, socket.error) as err:
+		parser.error( 'Failed to resolve irc socket parameters (address,'
+			' family) via getaddrinfo: {(host, port)} [{proto}] - {err_fmt(err)}' )
+	sock_af, sock_t, sock_p, _, sock_addr = addrinfo[0]
+	if log:
+		log.debug(
+			'Resolved host:port {!r}:{!r} [{}] to endpoint: {} (family: {}, type: {}, proto: {})',
+			host, port, proto, sock_addr, *( sockopt_resolve(pre, n)
+				for pre, n in [('af_', sock_af), ('sock_', sock_t), ('ipproto_', sock_p)] ) )
+	if (sock_t, sock_p) != sock_req: raise ValueError(sock_req, (sock_t, sock_p))
+	return (sock_t, sock_p, sock_af, *sock_addr[:2])
 
 
 def str_hash(s, c=None, key='kelp-1'):
@@ -885,6 +915,10 @@ class Kelp:
 		if self.tasks: await self.tasks.close()
 		self.init = False
 
+	def add_blades(self, blades):
+		blade_iface = KelpBladeInterface(self)
+		self.blades = list(blade(blade_iface) for blade in blades)
+
 	async def run(self):
 		ircd = await self.loop.create_server(
 			IRCProtocol.factory_for_bridge(self),
@@ -892,9 +926,11 @@ class Kelp:
 			family=self.conf.irc_host_af, start_serving=False )
 		### Other asyncio things should be initialized and started here
 		ircd_task = self.tasks.add(ircd.serve_forever())
-		self.log.debug('Starting ircd...')
-		await ircd_task
-		self.log.debug('Finished')
+		async with contextlib.AsyncExitStack() as ctx:
+			for blade in self.blades: await ctx.enter_async_context(blade)
+			self.log.debug('Starting ircd...')
+			await ircd_task
+			self.log.debug('Finished')
 
 	async def run_async(self):
 		async with self: await self.run()
@@ -1120,15 +1156,6 @@ class KelpConfig(KelpConfigBase):
 	def get(self, *k): return getattr(self, '_'.join(k))
 	def set(self, k, v): setattr(self, k, v)
 
-	def read(self, func, section, k, conf_k=None):
-		if not conf_k: conf_k = f'{section}_{k}'.replace('-', '_')
-		for k in k, k.replace('-', '_'), k.replace('_', '-'):
-			try:
-				self.set(conf_k, func(section, k))
-				return True
-			except configparser.NoSectionError: pass
-			except configparser.NoOptionError: pass
-
 	def pprint(self, title=None, empty_vals=False):
 		cat, chk = None, re.compile(
 			'^({})_(.*)$'.format('|'.join(map(re.escape, self._conf_sections))) )
@@ -1149,39 +1176,51 @@ class KelpConfig(KelpConfigBase):
 			print('\n[aliases]')
 			for k, v in self.aliases.items(): print(f'{".".join(k)} = {v}')
 
-	def read_from_file(self, *conf_paths):
-		conf_file = configparser.ConfigParser(allow_no_value=True)
-		conf_file.optionxform = lambda k: k
-		conf_file.read(conf_paths)
-		self._conf_path = conf_paths[-1]
-		for k in self._conf_sections:
-			self.update_from_file_section(conf_file, section=k, prefix=f'{k}_')
-		self.read(conf_file.getboolean, 'state', 'tracked')
-		self._state_section = conf_file.has_section('state')
-		if self.state_tracked and self._state_section:
-			for k, v in conf_file['state'].items():
-				if k == 'tracked': continue
-				self.state[k] = parse_iso8601(v)
-		if conf_file.has_section('aliases'):
-			for k, v in conf_file['aliases'].items():
-				if '.' not in k: continue
-				self.aliases[tuple(k.lower().split('.', 1))] = v
+	@classmethod
+	def read(cls, conf, func, section, k, conf_k=None):
+		if not conf_k: conf_k = f'{section}_{k}'.replace('-', '_')
+		conf_set = getattr(conf, 'set', lambda k, v: setattr(conf, k, v))
+		for k in k, k.replace('-', '_'), k.replace('_', '-'):
+			try:
+				conf_set(conf_k, func(section, k))
+				return True
+			except configparser.NoSectionError: pass
+			except configparser.NoOptionError: pass
 
-	def update_from_file_section(self, config, section='default', prefix=None):
+	@classmethod
+	def update_from_file_section(cls, conf, parser, section='default', prefix=None):
 		section = section.replace('_', '-')
-		for k in dir(self):
+		for k in dir(conf):
 			if prefix:
 				if not k.startswith(prefix): continue
 				conf_k, k = k, k[len(prefix):]
 			elif k.startswith('_'): continue
 			else: conf_k = k
-			v = getattr(self, conf_k)
-			if isinstance(v, str): get_val = lambda *a: str(config.get(*a, raw=True))
-			elif isinstance(v, bool): get_val = config.getboolean
-			elif isinstance(v, int): get_val = lambda *a: int(re.sub(r'[ _]', '', config.get(*a)))
-			elif isinstance(v, float): get_val = lambda *a: float(config.get(*a))
+			v = getattr(conf, conf_k)
+			if isinstance(v, str): get_val = lambda *a: str(parser.get(*a, raw=True))
+			elif isinstance(v, bool): get_val = parser.getboolean
+			elif isinstance(v, int): get_val = lambda *a: int(re.sub(r'[ _]', '', parser.get(*a)))
+			elif isinstance(v, float): get_val = lambda *a: float(parser.get(*a))
 			else: continue # values with other types cannot be specified in config
-			self.read(get_val, section, k, conf_k)
+			cls.read(conf, get_val, section, k, conf_k)
+
+	def read_from_file(self, *conf_paths):
+		parser = configparser.ConfigParser(allow_no_value=True)
+		parser.optionxform = lambda k: k
+		parser.read(conf_paths)
+		self._conf_path_list, self._conf_path = conf_paths, conf_paths[-1]
+		for k in self._conf_sections:
+			self.update_from_file_section(self, parser, section=k, prefix=f'{k}_')
+		self.read(self, parser.getboolean, 'state', 'tracked')
+		self._state_section = parser.has_section('state')
+		if self.state_tracked and self._state_section:
+			for k, v in parser['state'].items():
+				if k == 'tracked': continue
+				self.state[k] = parse_iso8601(v)
+		if parser.has_section('aliases'):
+			for k, v in parser['aliases'].items():
+				if '.' not in k: continue
+				self.aliases[tuple(k.lower().split('.', 1))] = v
 
 	def update_file_section(self, section, keys=None, path=None):
 		section = section.replace('_', '-')
@@ -1306,6 +1345,27 @@ class KelpConfig(KelpConfigBase):
 					continue
 				dst.write(line)
 		self._state_source_flush()
+
+
+class KelpBladeInterface:
+
+	lib = adict(adict=adict, str_hash=str_hash, gai_bind=gai_bind)
+
+	def __init__(self, kelp):
+		self.loop, self.conf = kelp.loop, kelp.conf
+
+	def get_logger(self, name, proto=False):
+		return get_logger( f'kelp.blade.{name}'
+			if not proto else f'proto.blade.{name}' )
+
+	def read_conf_section(self, section, conf):
+		if isinstance(conf, type): conf = conf()
+		parser = configparser.ConfigParser(allow_no_value=True)
+		parser.optionxform = lambda k: k
+		parser.read(self.conf._conf_path_list)
+		KelpConfig.update_from_file_section(conf, parser, section)
+		return conf
+
 
 
 def main(args=None, conf=None):
@@ -1440,26 +1500,31 @@ def main(args=None, conf=None):
 		log.error('Unhandled error: {}', err_fmt(err), exc_info=(err_t, err, err_tb))
 	sys.excepthook = handle_exception
 
-	host, port, family = opts.irc_bind or conf.irc_host, conf.irc_port, conf.irc_host_af
-	if host.count(':') > 1: host, port = str_part(host, ']:>', port)
-	else: host, port = str_part(host, ':>', port)
-	if '[' in host: family = socket.AF_INET6
-	host, port = host.strip('[]'), int(port)
-	try:
-		addrinfo = socket.getaddrinfo( host, str(port),
-			family=family, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP )
-		if not addrinfo: raise socket.gaierror(f'No addrinfo for host: {host}')
-	except (socket.gaierror, socket.error) as err:
-		parser.error( 'Failed to resolve irc socket parameters (address, family)'
-			' via getaddrinfo: {!r} - [{}] {}'.format((host, port), err.__class__.__name__, err) )
-	sock_af, sock_t, sock_p, _, sock_addr = addrinfo[0]
-	log.debug(
-		'Resolved irc host:port {!r}:{!r} to endpoint: {} (family: {}, type: {}, proto: {})',
-		host, port, sock_addr, *(sockopt_resolve(pre, n)
-			for pre, n in [('af_', sock_af), ('sock_', sock_t), ('ipproto_', sock_p)]) )
-	assert ( sock_t == socket.SOCK_STREAM
-		and sock_p == socket.IPPROTO_TCP ), [sock_t, sock_p]
-	conf.irc_host_af, (conf.irc_host, conf.irc_port) = sock_af, sock_addr[:2]
+	blades = conf.blades_enabled.split()
+	if blades:
+		import runpy
+		blades_dir = pl.Path(conf.blades_dir)
+		if not blades_dir.exists():
+			parser.error(f'Configured blades-dir path does not exists: {blades_dir}')
+		for n, name in enumerate(blades):
+			blade_files = [name]
+			if not name.endswith('.py'): blade_files.append(name + '.py')
+			else: name = name[:-3]
+			name = '.'.join([blades_dir.name, name])
+			while blade_files:
+				blade = blades_dir / blade_files.pop()
+				if not blade.exists(): continue
+				log.debug('Loading blade [{}]: {}', name, blade)
+				blade = runpy.run_path(blade, run_name=name)
+				try: ep_name, blade = list(blade.items())[-1]
+				except: parser.error(f'Blade missing init entry-point: {name}')
+				log.debug('Using entry-point [{}]: {}', name, ep_name)
+				break
+			else: blade = None
+			blades[n] = blade
+
+	sock_t, sock_p, conf.irc_host_af, conf.irc_host, conf.irc_port = \
+		gai_bind('tcp', opts.irc_bind or conf.irc_host, conf.irc_port, conf.irc_host_af, log)
 
 	log.debug('Starting eventloop...')
 	with contextlib.closing(asyncio.get_event_loop()) as loop:
@@ -1474,6 +1539,7 @@ def main(args=None, conf=None):
 		log_handler.addFilter(log_proto_debug_filter)
 		logging.root.addHandler(log_handler)
 
+		kelp.add_blades(blades)
 		kelp_task = loop.create_task(kelp.run_async())
 		for sig in 'INT TERM'.split():
 			loop.add_signal_handler(getattr(signal, f'SIG{sig}'), kelp_task.cancel)
