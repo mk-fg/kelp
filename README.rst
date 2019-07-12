@@ -122,25 +122,19 @@ anytime anyway.
 Channel Commands
 ````````````````
 
-| In special channels like #control and #debug: send "h" or "help".
+In special channels like #control and #debug: send "h" or "help", see topic there.
 
-asyncio ERROR :: Fatal read error on socket transport
-`````````````````````````````````````````````````````
+Plugins can react to user messages as well, in their own ways.
 
-Rarely this error might pop-up randomly, when websocket connection is patchy::
+Aliases
+```````
 
-  asyncio ERROR :: Fatal read error on socket transport
-  protocol: <asyncio.sslproto.SSLProtocol object at 0x7f057da99080>
-  transport: <_SelectorSocketTransport fd=9 read=polling write=<idle, bufsize=0>>
-  Traceback (most recent call last):
-    File "/usr/lib/python3.7/asyncio/selector_events.py", line 801, in _read_ready__data_received
-      data = self._sock.recv(self.max_size)
-  TimeoutError: [Errno 110] Connection timed out
+Can be defined in the config file to replace hash-based IDs with something
+easily readable::
 
-It's a problem in python3 asyncio, as described in `Python Issue 34148`_ and `PR#11576`_.
+  [aliases]
+  blade.cSug = urs
 
-Should be harmless, especially as both websocket and discord protocols have
-built-in keepalives to work around any kind of underlying connection problems.
+(to turn e.g. #cSug.info into #urs.info)
 
-.. _Python Issue 34148: https://bugs.python.org/issue34148
-.. _PR#11576: https://github.com/python/cpython/pull/11576
+Currently only implemented for Blade UIDs in IRC channel names.

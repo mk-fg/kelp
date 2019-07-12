@@ -3,7 +3,7 @@
 import itertools as it, operator as op, functools as ft
 import os, sys, stat, re, time, secrets, json, enum
 import contextlib, asyncio, socket, signal, inspect, traceback
-import hashlib, base64, unicodedata, configparser, tempfile
+import hashlib, base64, unicodedata, configparser, tempfile, runpy
 import collections as cs, collections.abc as cs_abc, datetime as dt, pathlib as pl
 import logging, logging.handlers
 
@@ -829,6 +829,8 @@ class IRCProtocol:
 
 
 
+class KelpError(Exception): pass
+
 class Kelp:
 
 	class c:
@@ -837,7 +839,7 @@ class Kelp:
 		chan_monitor = 'monitor'
 
 	def __init__(self, loop, conf):
-		self.loop, self.conf, self.init, self.blades = loop, conf, None, list()
+		self.loop, self.conf, self.init, self.blades = loop, conf, None, dict()
 		self.log = get_logger('kelp.bridge')
 		self._repr = ft.partial(str_repr, max_len=self.conf.debug_msg_cut)
 
@@ -883,10 +885,28 @@ class Kelp:
 			self.cache.uid[k], self.cache.uid[kh] = kh, k
 		return self.cache.uid[k]
 
-	def add_blades(self, blades):
-		self.blades.extend(
-			KelpBladeInterface(name, self, blade)
-			for name, blade in blades.items() )
+	def load_blades(self, blades):
+		blades_dir = pl.Path(self.conf.blades_dir)
+		if not blades_dir.exists():
+			raise KelpError(f'Configured blades-dir path does not exists: {blades_dir}')
+		for n, name in enumerate(blades):
+			blade_files = [name]
+			if not name.endswith('.py'): blade_files.append(name + '.py')
+			else: name = name[:-3]
+			mod_name = '.'.join([blades_dir.name, name])
+			while blade_files:
+				blade = blades_dir / blade_files.pop()
+				if not blade.exists(): continue
+				self.log.debug('Loading blade [{}]: {}', mod_name, blade)
+				blade = runpy.run_path(blade, run_name=mod_name)
+				try: ep_name, blade = list(blade.items())[-1]
+				except: raise KelpError(f'Blade missing init entry-point: {mod_name}') from None
+				self.log.debug('Using entry-point [{}]: {}', mod_name, ep_name)
+				break
+			else: blade = None
+			if name in self.blades: self.tasks.add(self.blades[name]._enabled(False))
+			self.blades[name] = blades[n] = KelpBladeInterface(name, self, blade)
+		return blades
 
 	async def run(self):
 		ircd = await self.loop.create_server(
@@ -896,7 +916,7 @@ class Kelp:
 		### Other asyncio things should be initialized and started here
 		ircd_task = self.tasks.add(ircd.serve_forever())
 		async with contextlib.AsyncExitStack() as ctx:
-			for blade in self.blades: await ctx.enter_async_context(blade)
+			for blade in self.blades.values(): await ctx.enter_async_context(blade)
 			self.log.debug('Starting ircd...')
 			await ircd_task
 			self.log.debug('Finished')
@@ -958,7 +978,7 @@ class Kelp:
 	def cmd_chan_names(self, name):
 		conn_nicks = irc_name_dict.value_map(
 			conn.st.nick for conn in self.cmd_chan_conns(name) )
-		for blade in self.blades:
+		for blade in self.blades.values():
 			if name not in blade._chan_names: continue
 			conn_nicks.update(blade._chan_names[name].items())
 		return sorted(conn_nicks.values())
@@ -969,7 +989,7 @@ class Kelp:
 			(name, adict( name=name,
 				topic=topic, ts_created=ts_created ))
 			for name, topic in self.chans_sys.items() )
-		for blade in self.blades:
+		for blade in self.blades.values():
 			if not blade._chan_map_func: continue
 			chan_map.update(
 				(name, adict(name=name, topic=topic, ts_created=ts_created))
@@ -989,8 +1009,14 @@ class Kelp:
 		return counts
 
 	def cmd_chan_sys_control_status(self, send):
+		bs = sorted(self.blades.values(), key=op.attrgetter('name'))
+		bs_off = sum(1 for b in bs if not b.enabled)
+		bs_st = f'total={len(bs)}'
+		if bs_off: bs_st = f'on={len(bs)-bs_off} off={bs_off} {bs_st}'
 		send('\n'.join([ 'Status:',
-			# XXX: service/bot states here
+			f'  blades ({bs_st}):',
+			*( (f'    - [{b._prefix}] {b.name}'
+				+ (' (disabled)' if not b.enabled else '')) for b in bs ),
 			f'  log-msg-counts: {self.cmd_chan_sys_log_counts()}' ]))
 
 	def cmd_chan_sys_control(self, conn, chan, line):
@@ -1003,16 +1029,21 @@ class Kelp:
 			send('\n'.join([
 				'Commands:',
 				'  status - (alias: st) show whether discord is connected and working',
-				'  connect - (alias: on) connect/login to discord',
-				'  disconnect - (alias: off) disconnect from discord',
+				'  enable [prefix/name ...] - (alias: on) enable/start specific blade(s) or all of them',
+				'  disable [prefix/name ...] - (alias: off) disable all blades or specified one(s)',
+				'  load name ... - (alias: run) (re-)load specified blade plugin(s) code',
+				'Well-behaved blades should re-parse all configuration on restart.',
 				'Only immediate response to sent commands is logged here - no noise over time.' ]))
 		elif cmd in ['status', 'st']: self.cmd_chan_sys_control_status(send)
-		elif cmd in ['connect', 'on']:
-			send('discord: connection started')
-			self.discord.connect()
-		elif cmd in ['disconnect', 'off']:
-			send('discord: disconnecting')
-			self.discord.disconnect()
+		elif cmd in ['enable', 'on', 'disable', 'off']:
+			blade_set, enable = set(line[1:]), cmd in ['enable', 'on']
+			send(f'{"Enabling" if enable else "Disabling"} blade(s): {" ".join(line[1:]) or "-all-"}')
+			for blade in self.blades.values():
+				if blade_set and not blade_set.intersection([blade.name, blade._prefix]): continue
+				self.tasks.add(blade._enabled(enable))
+		elif cmd in ['load', 'run'] and len(line) > 1:
+			send(f'(Re-)Loading blade(s): {" ".join(line[1:])}')
+			for blade in self.load_blades(line[1:]): self.tasks.add(blade._enabled())
 
 	def cmd_chan_sys_debug(self, conn, chan, line):
 		line_src, line = line, line.strip().lower().split()
@@ -1110,6 +1141,7 @@ class Kelp:
 
 	def cmd_msg_blade(self, chan, nick, line, notice=False, conn=None):
 		direct, conn_list = bool(conn), [conn] if conn else self.cmd_chan_conns(chan)
+		line
 		if not conn: conn = conn_list[0] if conn_list else self.cmd_conn()
 		if not conn: return
 		if not direct:
@@ -1336,17 +1368,26 @@ class KelpBladeInterface:
 
 	def __init__(self, name, kelp, blade_init):
 		self.bridge, self.loop, self.conf = kelp, kelp.loop, kelp.conf
-		self.name, self.blade = name, blade_init(self)
+		self.name, self.blade, self.enabled = name, blade_init(self), False
+		self._chan_names = self._chan_map_func = self._chan_act_func = None
 
 	async def __aenter__(self):
+		if self.enabled: return
 		self._prefix = self.bridge.uid('blade', self.name)
 		self._chan_map_func = self._chan_act_func = None
 		self._chan_names = irc_name_dict()
 		await self.blade.__aenter__()
+		self.enabled = True
 		return self
 	async def __aexit__(self, *err):
+		if not self.enabled: return
 		await self.blade.__aexit__(*err)
 		self._chan_names = self._chan_map_func = self._chan_act_func = None
+		self.enabled = False
+
+	async def _enabled(self, state=True):
+		if state: await self.__aenter__()
+		else: await self.__aexit__()
 
 	def _chan_name(self, chan): return f'{self._prefix}.{chan}'
 
@@ -1528,30 +1569,6 @@ def main(args=None, conf=None):
 		log.error('Unhandled error: {}', err_fmt(err), exc_info=(err_t, err, err_tb))
 	sys.excepthook = handle_exception
 
-	blades = conf.blades_enabled.split()
-	if blades:
-		import runpy
-		blades_dir = pl.Path(conf.blades_dir)
-		if not blades_dir.exists():
-			parser.error(f'Configured blades-dir path does not exists: {blades_dir}')
-		blades, blades_list = dict(), blades
-		for name in blades_list:
-			blade_files = [name]
-			if not name.endswith('.py'): blade_files.append(name + '.py')
-			else: name = name[:-3]
-			mod_name = '.'.join([blades_dir.name, name])
-			while blade_files:
-				blade = blades_dir / blade_files.pop()
-				if not blade.exists(): continue
-				log.debug('Loading blade [{}]: {}', mod_name, blade)
-				blade = runpy.run_path(blade, run_name=mod_name)
-				try: ep_name, blade = list(blade.items())[-1]
-				except: parser.error(f'Blade missing init entry-point: {mod_name}')
-				log.debug('Using entry-point [{}]: {}', mod_name, ep_name)
-				break
-			else: blade = None
-			blades[name] = blade
-
 	sock_t, sock_p, conf.irc_host_af, conf.irc_host, conf.irc_port = \
 		gai_bind('tcp', opts.irc_bind or conf.irc_host, conf.irc_port, conf.irc_host_af, log)
 
@@ -1568,7 +1585,9 @@ def main(args=None, conf=None):
 		log_handler.addFilter(log_proto_debug_filter)
 		logging.root.addHandler(log_handler)
 
-		if blades: kelp.add_blades(blades)
+		blades = conf.blades_enabled.split()
+		if blades: kelp.load_blades(blades)
+
 		kelp_task = loop.create_task(kelp.run_async())
 		for sig in 'INT TERM'.split():
 			loop.add_signal_handler(getattr(signal, f'SIG{sig}'), kelp_task.cancel)

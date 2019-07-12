@@ -30,14 +30,14 @@ err_fmt = lambda err: '[{}] {}'.format(err.__class__.__name__, err)
 class UDPReportSink:
 
 	def __init__(self, iface):
-		self.loop, self.conf = ( iface.loop,
-			iface.read_conf_section('udp-report-sink', UDPRSConf) )
-		self.chan_keys = dict(iface.read_conf_section('udp-report-sink-keys').items())
 		self.iface, self.log = iface, iface.get_logger('udprs')
-		if not self.conf.cb_key:
-			raise ValueError('Local CryptoBox Seed value must be specified in config file')
+		self.log_proto = iface.get_logger('udprs', proto=True)
 
 	async def __aenter__(self):
+		self.loop, self.conf = ( self.iface.loop,
+			self.iface.read_conf_section('udp-report-sink', UDPRSConf) )
+		chan_info = self.iface.read_conf_section('udp-report-sink-keys').items()
+
 		self.pkt_header = struct.Struct(f'>{self.conf.uid_len}sH')
 		bit, bits, bit_max = 0, list(), self.conf.uid_len * 8 - 1
 		ns = list(int(n.strip()) for n in self.conf.uid_mask_intervals.split(','))
@@ -58,12 +58,8 @@ class UDPReportSink:
 		self.uid_match = lambda uid: int.from_bytes(uid, 'big') & mask == mask_val
 		self.log.debug('uid-mask={:x} uid-mask-val={:x}', mask, mask_val)
 
-		self.frags = dict()
-		self.conn_id = self.iface.lib.str_hash(os.urandom(8), 3, key='udprs-1')
-		self.log_proto = self.iface.get_logger('udprs', proto=True)
-
 		b64dec, b64enc = self.iface.lib.b64_decode, self.iface.lib.b64_encode
-		chan_map, self.chan_names = dict(), dict()
+		chan_map, self.chan_names, self.chan_keys = dict(), dict(), dict(chan_info)
 		topic_base = self.conf.topic.format(conf=self.conf)
 		for k, v in sorted(self.chan_keys.items(), key=lambda kv: len(kv[0])):
 			if k.endswith('-topic'): chan_map[k[:-6]] = self.chan_keys.pop(k)
@@ -74,9 +70,12 @@ class UDPReportSink:
 		self.iface.reg_chan_map_func(lambda: chan_map)
 		for chan, nick in self.chan_names.items(): self.iface.reg_name(chan, nick)
 
+		if not self.conf.cb_key:
+			raise ValueError('Local CryptoBox Seed value must be specified in config file')
 		self.pk, self.sk = libnacl.crypto_box_seed_keypair(b64dec(self.conf.cb_key))
 		self.log.debug('Local crypto_box pubkey: {}', b64enc(self.pk))
 
+		self.frags = dict()
 		sock_t, sock_p, self.conf.host_af, self.conf.host, self.conf.port = \
 			self.iface.lib.gai_bind('udp', self.conf.host, self.conf.port, self.conf.host_af, self.log)
 		self.transport, proto = await self.loop.create_datagram_endpoint( lambda: self,
@@ -141,6 +140,7 @@ class UDPReportSink:
 		for pk, chan in self.chan_keys.items():
 			try: lines = libnacl.crypto_box_open(buff, nonce, pk, self.sk)
 			except libnacl.CryptError: continue
+			lines = lines.decode('utf-8', 'replace')
 			self.iface.send_msg(chan, self.chan_names[chan], lines)
 			return pk
 		else:
