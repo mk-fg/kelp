@@ -107,6 +107,7 @@ class UDPReportSink:
 		ts_cutoff = time.monotonic() - self.conf.recv_timeout
 		for uid_chk, entry in list(self.frags.items()):
 			if entry.ts > ts_cutoff: break
+			# XXX: check if it's still incomplete and report error
 			self.frags.pop(uid_chk)
 
 		# Fragment processing
@@ -131,6 +132,7 @@ class UDPReportSink:
 		buff = b''.join(buff)
 
 		# Decrypt/auth/parse and ack
+		# Note: frags entry is left as-is until it times-out to avoid re-parsing duplicates
 		# XXX: receive heartbeats and track hb-interval info, check remote error counter there
 		pk = self.parse(addr_str, uid_str, buff)
 		if pk: self.send_ack(addr_str, uid_str, pk, uid, addr)

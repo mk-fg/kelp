@@ -10,7 +10,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.97' # git-version: py-str
+	version = '1.3' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -819,7 +819,13 @@ class IRCProtocol:
 			self.send(302, f':{nick}=+~{self.st.user}@{self.st.host}')
 		else: self.send(401, nick, ':No such nick/channel')
 
-	# recv_cmd_who
+	def recv_cmd_who(self, name):
+		conn = self.bridge.cmd_conn_map().get(name)
+		if conn:
+			self.send( 352, '*', conn.st.user, conn.st.host,
+				self.bridge.server_host,conn.st.nick, 'H', f':0 {conn.st.nick}' )
+		self.send(315, name, ':End of /WHO list.')
+
 	# recv_cmd_whois
 	# recv_cmd_whowas
 	# recv_cmd_admin
