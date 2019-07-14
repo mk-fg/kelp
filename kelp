@@ -10,7 +10,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.3' # git-version: py-str
+	version = '1.5' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -173,7 +173,7 @@ def gai_bind(proto, bind, port='', family=0, log=None):
 	if proto not in ['tcp', 'udp']: raise ValueError(proto)
 	host, sock_req = bind, (
 		(socket.SOCK_STREAM, socket.IPPROTO_TCP)
-		if 'tcp' else (socket.SOCK_DGRAM, socket.IPPROTO_UDP) )
+		if proto == 'tcp' else (socket.SOCK_DGRAM, socket.IPPROTO_UDP) )
 	if host.count(':') > 1: host, port = str_part(host, ']:>', port)
 	else: host, port = str_part(host, ':>', port)
 	if '[' in host: family = socket.AF_INET6
@@ -183,7 +183,7 @@ def gai_bind(proto, bind, port='', family=0, log=None):
 			family=family, type=sock_req[0], proto=sock_req[1] )
 		if not addrinfo: raise socket.gaierror(f'No addrinfo for host: {host}')
 	except (socket.gaierror, socket.error) as err:
-		parser.error( 'Failed to resolve irc socket parameters (address,'
+		parser.error( 'Failed to resolve socket parameters (address,'
 			' family) via getaddrinfo: {(host, port)} [{proto}] - {err_fmt(err)}' )
 	sock_af, sock_t, sock_p, _, sock_addr = addrinfo[0]
 	if log:
@@ -306,22 +306,6 @@ async def aio_task_cancel(task_list):
 		with contextlib.suppress(asyncio.CancelledError): task.cancel()
 	for task in task_list:
 		with contextlib.suppress(asyncio.CancelledError): await task
-
-async def aio_wait_or_cancel(
-		loop, task, timeout, default=..., cancel_suppress=None ):
-	'Like asyncio.wait_for, but also awaits the task that it cancels.'
-	if asyncio.iscoroutine(task): task = loop.create_task(task)
-	try: return await asyncio.wait_for(task, timeout)
-	except asyncio.TimeoutError:
-		if default is ...:
-			err = sys.exc_info()
-			err = err[1].with_traceback(err[2])
-		task.cancel()
-		with contextlib.suppress(
-			asyncio.CancelledError, *(cancel_suppress or list()) ): await task
-		if default is ...: raise err from None
-		else: return default
-
 
 class StacklessContext:
 	'''Like AsyncContextStack, but for tracking tasks that

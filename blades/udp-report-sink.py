@@ -60,20 +60,24 @@ class UDPReportSink:
 
 		b64dec, b64enc = self.iface.lib.b64_decode, self.iface.lib.b64_encode
 		chan_map, self.chan_names, self.chan_keys = dict(), dict(), dict(chan_info)
-		topic_base = self.conf.topic.format(conf=self.conf)
+		chan_key_list, topic_base = dict(), self.conf.topic.format(conf=self.conf)
 		for k, v in sorted(self.chan_keys.items(), key=lambda kv: len(kv[0])):
 			if k.endswith('-topic'): chan_map[k[:-6]] = self.chan_keys.pop(k)
 			elif k.endswith('-nick'): self.chan_names[k[:-5]] = self.chan_keys.pop(k)
 			else:
 				chan_map[k], self.chan_names[k] = topic_base, self.conf.nick
-				for pk in self.chan_keys.pop(k).split(): self.chan_keys[b64dec(pk)] = k
+				for pk in self.chan_keys.pop(k).split():
+					self.chan_keys[b64dec(pk)] = k
+					chan_key_list.setdefault(k, list()).append(pk)
 		self.iface.reg_chan_map_func(lambda: chan_map)
 		for chan, nick in self.chan_names.items(): self.iface.reg_name(chan, nick)
 
 		if not self.conf.cb_key:
 			raise ValueError('Local CryptoBox Seed value must be specified in config file')
 		self.pk, self.sk = libnacl.crypto_box_seed_keypair(b64dec(self.conf.cb_key))
-		self.log.debug('Local crypto_box pubkey: {}', b64enc(self.pk))
+		self.log.debug('Local crypto_box pubkey: {}', b64enc(self.pk)) # for sender
+		for k, pk_list in chan_key_list.items():
+			self.log.debug('Channel pubkeys [{}]: {}', k, ' '.join(pk_list))
 
 		self.frags = dict()
 		sock_t, sock_p, self.conf.host_af, self.conf.host, self.conf.port = \
