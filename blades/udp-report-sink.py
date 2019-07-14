@@ -30,6 +30,7 @@ class UDPRSConf:
 
 
 err_fmt = lambda err: '[{}] {}'.format(err.__class__.__name__, err)
+ts_fmt = lambda ts: time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
 
 
 class UDPReportSink:
@@ -102,15 +103,13 @@ class UDPReportSink:
 			try:
 				for pk, hb in self.hbs.items():
 					if self.loop.time() - hb.ts_mono < hb.interval * grace_factor: continue
-					chan, pk_b64 = self.chan_keys[pk], self.iface.lib.b64_encode(pk)
-					ts_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(hb.ts))
+					pk_b64, chan = self.iface.lib.b64_encode(pk), self.chan_keys[pk]
 					self.iface.send_msg( chan, self.chan_names[chan],
 						f'-------- HB-MISSING: pk={pk_b64}'
-							f' err-count={hb.err_count} ts-last=[{ts_str}] --------', notice=True )
+							f' err-count={hb.err_count} ts-last=[{ts_fmt(hb.ts)}] --------', notice=True )
 			except Exception as err: # not checked until shutdown otherwise
 				self.log.exception('Heartbeat-check error: {}', err_fmt(err))
 			await asyncio.sleep(interval)
-
 
 
 	def connection_made(self, transport):
@@ -135,14 +134,14 @@ class UDPReportSink:
 		for uid_chk, entry in list(self.frags.items()):
 			if entry.ts > ts_cutoff: break
 			self.frags.pop(uid_chk)
-			if not entry.get('sent'):
-				timeout_err = '???'
-				if entry.c is None: timeout_err = f'no final frame (total={len(entry)-1})'
-				else:
-					n = sum(1 for n in range(entry.c + 1) if n in entry)
-					if n < entry.c: timeout_err = f'missing frames (recv={n}/{entry.c})'
-				self.log.error( 'Entry timed-out [{}]: {}',
-					self.iface.lib.b64_encode(uid_chk), timeout_err )
+			if entry.get('sent'): continue
+			timeout_err = '???'
+			if entry.c is None: timeout_err = f'no final frame (total={len(entry)-1})'
+			else:
+				n = sum(1 for n in range(entry.c + 1) if n in entry)
+				if n < entry.c: timeout_err = f'missing frames (recv={n}/{entry.c})'
+			self.log.error( 'Entry timed-out [{}]: {}',
+				self.iface.lib.b64_encode(uid_chk), timeout_err )
 
 		# Fragment processing
 		if seq & 0x8000: final, seq = True, seq - 0x8000
@@ -181,10 +180,9 @@ class UDPReportSink:
 				hb = self.hbs.get(pk)
 				if hb and err_count > hb.err_count:
 					pk_b64, err_diff = self.iface.lib.b64_encode(pk), err_count - hb.err_count
-					ts_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(hb.ts))
 					self.iface.send_msg(
-						chan, self.chan_names[chan], '-------- HB-ERR-COUNT:'
-							f' pk={pk_b64} err-inc={err_diff} ts-last=[{ts_str}] --------', notice=True )
+						chan, self.chan_names[chan], '-------- HB-ERR-COUNT: pk={pk_b64}'
+							f' err-inc={err_diff} ts-last=[{ts_fmt(hb.ts)}] --------', notice=True )
 				self.hbs[pk] = self.iface.lib.adict( ts=time.time(),
 					ts_mono=self.loop.time(), interval=hb_interval, err_count=err_count )
 			else:

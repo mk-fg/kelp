@@ -25,6 +25,7 @@ def main():
 	dst_pk = b64_decode('Msf_VdIGWquWN2SwCs9A4hDaE9rBUSkoxWiiOiLCQkY=')
 	src_pk, src_sk = libnacl.crypto_box_seed_keypair(
 		b64_decode('q7S6eb9dHlLdOi3h-8kgFrzFllxEcR8vqDd50Yj1HcA=') )
+	print('src-pk:', b64_encode(src_pk))
 	mtu = 500
 
 	uid_len = 8
