@@ -10,6 +10,11 @@ class UDPRSConf:
 	host_af = 0
 	recv_timeout = 5 * 60.0
 
+	hb_check_interval = 30 * 60
+	hb_check_grace_factor = 4.3
+	hb_magic = b'\0hb\0'
+	hb_data = struct.Struct('>IQ')
+
 	cb_key = '' # must be specified
 	topic = 'udp-report-sink [{conf.host}:{conf.port}]'
 	nick = 'ursa'
@@ -79,15 +84,33 @@ class UDPReportSink:
 		for k, pk_list in chan_key_list.items():
 			self.log.debug('Channel pubkeys [{}]: {}', k, ' '.join(pk_list))
 
-		self.frags = dict()
+		self.frags, self.hbs = dict(), dict()
 		sock_t, sock_p, self.conf.host_af, self.conf.host, self.conf.port = \
 			self.iface.lib.gai_bind('udp', self.conf.host, self.conf.port, self.conf.host_af, self.log)
 		self.transport, proto = await self.loop.create_datagram_endpoint( lambda: self,
 			local_addr=(self.conf.host, self.conf.port), family=self.conf.host_af, proto=sock_p )
+		self.hbs_task = self.loop.create_task(self.hbs_check(
+			self.conf.hb_check_interval, self.conf.hb_check_grace_factor ))
 
 	async def __aexit__(self, *err):
+		if self.hbs_task: self.hbs_task = await self.iface.lib.aio_task_cancel(self.hbs_task)
 		if self.transport: self.transport = self.transport.close()
 		self.frags = None
+
+	async def hbs_check(self, interval, grace_factor):
+		while True:
+			try:
+				for pk, hb in self.hbs.items():
+					if self.loop.time() - hb.ts_mono < hb.interval * grace_factor: continue
+					chan, pk_b64 = self.chan_keys[pk], self.iface.lib.b64_encode(pk)
+					ts_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(hb.ts))
+					self.iface.send_msg( chan, self.chan_names[chan],
+						f'-------- HB-MISSING: pk={pk_b64}'
+							f' err-count={hb.err_count} ts-last=[{ts_str}] --------', notice=True )
+			except Exception as err: # not checked until shutdown otherwise
+				self.log.exception('Heartbeat-check error: {}', err_fmt(err))
+			await asyncio.sleep(interval)
+
 
 
 	def connection_made(self, transport):
@@ -111,8 +134,15 @@ class UDPReportSink:
 		ts_cutoff = time.monotonic() - self.conf.recv_timeout
 		for uid_chk, entry in list(self.frags.items()):
 			if entry.ts > ts_cutoff: break
-			# XXX: check if it's still incomplete and report error
 			self.frags.pop(uid_chk)
+			if not entry.get('sent'):
+				timeout_err = '???'
+				if entry.c is None: timeout_err = f'no final frame (total={len(entry)-1})'
+				else:
+					n = sum(1 for n in range(entry.c + 1) if n in entry)
+					if n < entry.c: timeout_err = f'missing frames (recv={n}/{entry.c})'
+				self.log.error( 'Entry timed-out [{}]: {}',
+					self.iface.lib.b64_encode(uid_chk), timeout_err )
 
 		# Fragment processing
 		if seq & 0x8000: final, seq = True, seq - 0x8000
@@ -133,21 +163,33 @@ class UDPReportSink:
 		for n in range(entry.c + 1):
 			if n not in entry: return
 			buff.append(entry[n])
-		buff = b''.join(buff)
+		entry.sent, buff = True, b''.join(buff)
 
 		# Decrypt/auth/parse and ack
 		# Note: frags entry is left as-is until it times-out to avoid re-parsing duplicates
-		# XXX: receive heartbeats and track hb-interval info, check remote error counter there
 		pk = self.parse(addr_str, uid_str, buff)
 		if pk: self.send_ack(addr_str, uid_str, pk, uid, addr)
 
 	def parse(self, addr_str, uid_str, buff):
 		nonce, buff = buff[:24], buff[24:]
 		for pk, chan in self.chan_keys.items():
-			try: lines = libnacl.crypto_box_open(buff, nonce, pk, self.sk)
+			try: pkt = libnacl.crypto_box_open(buff, nonce, pk, self.sk)
 			except libnacl.CryptError: continue
-			lines = lines.decode('utf-8', 'replace')
-			self.iface.send_msg(chan, self.chan_names[chan], lines)
+			if pkt.startswith(self.conf.hb_magic):
+				n, fmt = len(self.conf.hb_magic), self.conf.hb_data
+				hb_interval, err_count = fmt.unpack(pkt[n:n + fmt.size])
+				hb = self.hbs.get(pk)
+				if hb and err_count > hb.err_count:
+					pk_b64, err_diff = self.iface.lib.b64_encode(pk), err_count - hb.err_count
+					ts_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(hb.ts))
+					self.iface.send_msg(
+						chan, self.chan_names[chan], '-------- HB-ERR-COUNT:'
+							f' pk={pk_b64} err-inc={err_diff} ts-last=[{ts_str}] --------', notice=True )
+				self.hbs[pk] = self.iface.lib.adict( ts=time.time(),
+					ts_mono=self.loop.time(), interval=hb_interval, err_count=err_count )
+			else:
+				lines = pkt.decode('utf-8', 'replace')
+				self.iface.send_msg(chan, self.chan_names[chan], lines)
 			return pk
 		else:
 			self.log.error( 'No key to decode msg:'

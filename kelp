@@ -1353,7 +1353,8 @@ class KelpBladeInterface:
 
 	lib = adict(
 		adict=adict, str_hash=str_hash, gai_bind=gai_bind,
-		b64_encode=b64_encode, b64_decode=b64_decode )
+		b64_encode=b64_encode, b64_decode=b64_decode,
+		aio_await_wrap=aio_await_wrap, aio_task_cancel=aio_task_cancel )
 	act_t = enum.Enum('act_t', 'names msg topic')
 
 	def __init__(self, name, kelp, blade_init):
