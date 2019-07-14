@@ -31,8 +31,6 @@ def main():
 	uid_mask = 0x1008104104104104
 	uid_mask_val = 0x100004100100
 
-	pkt_header = struct.Struct(f'>{uid_len}sH')
-
 	report = '''
 		2019-07-11 13:56:27,728 :: main DEBUG :: Loading blade [blades.udp-report-sink]: blades/udp-report-sink.py
 		2019-07-11 13:56:27,733 :: main DEBUG :: Using entry-point [blades.udp-report-sink]: blade_init
@@ -49,27 +47,56 @@ def main():
 
 	with socket.socket( socket.AF_INET,
 			socket.SOCK_DGRAM, socket.IPPROTO_UDP ) as s:
-		# XXX: send heartbeats and hb-interval info, as well as error counter
 
-		uid, n = os.urandom(uid_len), 0
-		uid = ((int.from_bytes(uid, 'big') & ~uid_mask) | uid_mask_val).to_bytes(8, 'big')
-		print('uid:', uid)
+		pkt_header = struct.Struct(f'>{uid_len}sH')
 		data_len = mtu - pkt_header.size
+		def data_send(uid, buff):
+			n, nonce = 0, os.urandom(24)
+			buff = nonce + libnacl.crypto_box(buff, nonce, dst_pk, src_sk)
+			while buff:
+				frame, buff = buff[:data_len], buff[data_len:]
+				frame_n, n = n, n + 1
+				if not buff: frame_n |= 0x8000
+				frame = pkt_header.pack(uid, frame_n) + frame
+				print(f'Frame {frame_n & (0xffff - 0x8000)}: {len(frame)}B')
+				s.sendto(frame, dst_addr)
+			# Sending should be repeated a few times until it gets ack response
 
-		nonce = os.urandom(24)
-		buff = nonce + libnacl.crypto_box(report, nonce, dst_pk, src_sk)
-		while buff:
-			frame, buff = buff[:data_len], buff[data_len:]
-			frame_n, n = n, n + 1
-			if not buff: frame_n |= 0x8000
-			frame = pkt_header.pack(uid, frame_n) + frame
-			print(f'Frame {frame_n & (0xffff - 0x8000)}: {len(frame)}B')
-			s.sendto(frame, dst_addr)
-		# Sending should be repeated a few times until it gets ack response
+		def data_ack_recv():
+			buff, addr = s.recvfrom(65535)
+			nonce, buff = buff[:24], buff[24:]
+			return libnacl.crypto_box_open(buff, nonce, dst_pk, src_sk)
 
-		buff, addr = s.recvfrom(65535)
-		nonce, buff = buff[:24], buff[24:]
-		uid_ack = libnacl.crypto_box_open(buff, nonce, dst_pk, src_sk)
-		print('success' if uid_ack == uid else 'ack-mismatch')
+		gen_uid = lambda: (
+			(int.from_bytes(os.urandom(uid_len), 'big') & ~uid_mask)
+			| uid_mask_val ).to_bytes(8, 'big')
+
+		### Send/ack report lines
+
+		uid = gen_uid()
+		print('uid:', uid)
+		data_send(uid, report)
+		uid_ack = data_ack_recv()
+		print('ack-success' if uid_ack == uid else 'ack-mismatch')
+
+		### Send/ack heartbeats
+
+		interval, err_count = 10, 0
+
+		uid = gen_uid()
+		hb = b'\0hb\0' + struct.pack('>IQ', interval, err_count)
+		data_send(uid, hb)
+		uid_ack = data_ack_recv()
+		print('hb-ack-success' if uid_ack == uid else 'hb-ack-mismatch')
+
+		err_count += 123 # should trigger HB-ERR-COUNT notice
+		uid = gen_uid()
+		hb = b'\0hb\0' + struct.pack('>IQ', interval, err_count)
+		data_send(uid, hb)
+		uid_ack = data_ack_recv()
+		print('hb-ack-success' if uid_ack == uid else 'hb-ack-mismatch')
+
+		# Missing follow-up heartbeats should trigger HB-MISSING notices
+		# But note that these are only checked 1/hb_check_interval (e.g. 1/30m)
 
 if __name__ == '__main__': sys.exit(main())
