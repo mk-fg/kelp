@@ -80,11 +80,18 @@ Config sections:
 
 - udp-report-sink-chans - channel to source nacl crypto_box pubkeys mapping.
 
-  Each key is a channel name, values are space-separated crypto_box pubkeys for
-  all potential sources which will be dumped into this channel.
+  Each key is a channel name, values are space-separated crypto_box pubkeys or
+  @name aliases (from udp-report-sink-keys secion) for all potential sources
+  which will be dumped into this channel.
 
   Special "{chan}-topic" and "{chan}-nick" keys can be used to specify
   topic/nick for each channel, otherwise defauls from udp-report-sink will be used.
+
+- udp-report-sink-keys
+
+  "name = b64(pk)" aliases for source pubkeys, so that any reports about these
+  (e.g. missing heartbeats, error count, etc) will have easy-to-read name
+  instead of hard-to-remember keys.
 
 See blades/udp-report-send-test.py for an example of simple sender script.
 
