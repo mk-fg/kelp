@@ -10,7 +10,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.5' # git-version: py-str
+	version = '1.6' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -888,7 +888,7 @@ class Kelp:
 				blade = blades_dir / blade_files.pop()
 				if not blade.exists(): continue
 				self.log.debug('Loading blade [{}]: {}', mod_name, blade)
-				blade = runpy.run_path(blade, run_name=mod_name)
+				blade = runpy.run_path(str(blade), run_name=mod_name)
 				try: ep_name, blade = list(blade.items())[-1]
 				except: raise KelpError(f'Blade missing init entry-point: {mod_name}') from None
 				self.log.debug('Using entry-point [{}]: {}', mod_name, ep_name)
