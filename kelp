@@ -10,7 +10,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.6' # git-version: py-str
+	version = '1.7' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -826,7 +826,7 @@ class Kelp:
 	class c:
 		chan_control = 'control'
 		chan_debug = 'debug'
-		chan_monitor = 'monitor'
+		chan_monitor = 'firehose'
 
 	def __init__(self, loop, conf):
 		self.loop, self.conf, self.init, self.blades = loop, conf, None, dict()
@@ -1131,7 +1131,6 @@ class Kelp:
 
 	def cmd_msg_blade(self, chan, nick, line, notice=False, conn=None):
 		direct, conn_list = bool(conn), [conn] if conn else self.cmd_chan_conns(chan)
-		line
 		if not conn: conn = conn_list[0] if conn_list else self.cmd_conn()
 		if not conn: return
 		if not direct:
