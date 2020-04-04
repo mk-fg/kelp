@@ -41,8 +41,8 @@ Connect IRC client to "localhost:6667" (see ``./kelp --conf-dump-defaults``
 or -i/--irc-bind option for using diff host/port).
 
 Run ``/list`` to see channels for all running bots, services and such,
-as well as server control channels (#control, #debug) and catch-all #monitor,
-see topics for more info on these.
+as well as server control channels (#kelp.control, #kelp.debug) and catch-all
+#kelp.monitor, see topics for more info on these.
 
 
 "blade" plugins

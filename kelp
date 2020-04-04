@@ -10,7 +10,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.7' # git-version: py-str
+	version = '1.8' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -24,8 +24,8 @@ class KelpConfigBase:
 	irc_len_hwm = 450 # will probably still work with most clients
 	irc_len_lwm = 300
 	irc_len_topic = 300 # cannot be split, so is truncated instead
-	irc_len_monitor = 350 # to tuncate long lines in #monitor
-	irc_len_monitor_lines = 4 # to tuncate multiline msgs in #monitor
+	irc_len_monitor = 350 # to tuncate long lines in #kelp.monitor
+	irc_len_monitor_lines = 4 # to tuncate multiline msgs in #kelp.monitor
 
 	irc_uid_len = 4 # uid for blades, can be increased to fix conflicts
 	irc_uid_seed = ''
@@ -84,7 +84,7 @@ class LogEmptyMsgFilter(logging.Filter):
 log_empty_filter = LogEmptyMsgFilter()
 
 class LogProtoDebugFilter(logging.Filter):
-	debug_re = re.compile(b'^:core (PRIVMSG|NOTICE) #debug :')
+	debug_re = re.compile(rb'^:core (PRIVMSG|NOTICE) #kelp\.debug :')
 	def filter(self, record):
 		try: st, msg = record.extra
 		except: return True
@@ -824,9 +824,9 @@ class KelpError(Exception): pass
 class Kelp:
 
 	class c:
-		chan_control = 'control'
-		chan_debug = 'debug'
-		chan_monitor = 'firehose'
+		chan_control = 'kelp.control'
+		chan_debug = 'kelp.debug'
+		chan_monitor = 'kelp.monitor'
 
 	def __init__(self, loop, conf):
 		self.loop, self.conf, self.init, self.blades = loop, conf, None, dict()
