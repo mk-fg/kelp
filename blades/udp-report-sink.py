@@ -30,7 +30,6 @@ class UDPRSConf:
 	# See also: udp-report-sink-chans mapping of chans to keys/topics.
 
 
-err_fmt = lambda err: '[{}] {}'.format(err.__class__.__name__, err)
 ts_fmt = lambda ts: time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
 
 
@@ -116,7 +115,7 @@ class UDPReportSink:
 						f'-------- HB-MISSING: pk={pk_b64}'
 							f' err-count={hb.err_count} ts-last=[{ts_fmt(hb.ts)}] --------', notice=True )
 			except Exception as err: # not checked until shutdown otherwise
-				self.log.exception('Heartbeat-check error: {}', err_fmt(err))
+				self.log.exception('Heartbeat-check error: {}', self.iface.lib.err_fmt(err))
 			await asyncio.sleep(interval)
 
 
@@ -127,7 +126,7 @@ class UDPReportSink:
 
 	def connection_lost(self, err):
 		reason = err or 'closed cleanly'
-		if isinstance(reason, Exception): reason = err_fmt(reason)
+		if isinstance(reason, Exception): reason = self.iface.lib.err_fmt(reason)
 		self.log_proto.debug('--- -close- :: {}', reason, extra=('---', f'close'))
 
 	def datagram_received(self, data, addr):

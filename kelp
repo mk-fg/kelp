@@ -10,7 +10,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.9' # git-version: py-str
+	version = '1.10' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -291,6 +291,18 @@ def token_bucket(spec, negative_tokens=False):
 			((val - tokens) / rate, (tokens - val) if negative_tokens else tokens)
 		val = (yield val) or 1
 
+def retries_within_timeout( tries, timeout,
+		backoff_func=lambda e,n: ((e**n-1)/e), slack=1e-2 ):
+	if timeout == 0: return list() # single attempt, regardless of tries
+	a, b = 0, timeout
+	while True:
+		m = (a + b) / 2
+		delays = list(backoff_func(m, n) for n in range(tries))
+		error = sum(delays) - timeout
+		if abs(error) < slack: return delays
+		elif error > 0: b = m
+		else: a = m
+
 
 async def aio_await_wrap(res):
 	'Wraps coroutine, callable that creates one or any other awaitable.'
@@ -306,6 +318,31 @@ async def aio_task_cancel(task_list):
 		with contextlib.suppress(asyncio.CancelledError): task.cancel()
 	for task in task_list:
 		with contextlib.suppress(asyncio.CancelledError): await task
+
+async def aio_loop(*tasks, gc_only=False):
+	'Poll/Cancel/await loop-tasks, which are never supposed to return.'
+	task_res, tasks = None, list(filter(None, tasks))
+	if not gc_only:
+		if not tasks: raise ValueError('No tasks passed')
+		for n, t in enumerate(tasks):
+			if not hasattr(t, 'cancel'): tasks[n] = asyncio.create_task(t)
+		try:
+			done, pending = await asyncio.wait(
+				tasks, return_when=asyncio.FIRST_COMPLETED )
+			task_res = list(done)[0]
+		except asyncio.CancelledError as err: task_res = err # will be re-raised
+	for task in tasks:
+		if not task.done(): task.cancel()
+		try: await task
+		except asyncio.CancelledError: continue
+		except: task_res = task
+		if not task_res: task_res = task
+	if task_res:
+		if not hasattr(task_res, 'cancel'): raise task_res from task_res
+		res = await task_res
+		if not gc_only: raise RuntimeError(f'Loop-task finished unexpectedly: {task_res}')
+		else: return res
+def aio_gc(*tasks): return aio_loop(*tasks, gc_only=True)
 
 class StacklessContext:
 	'''Like AsyncContextStack, but for tracking tasks that
@@ -906,11 +943,13 @@ class Kelp:
 			self.conf.irc_host, self.conf.irc_port,
 			family=self.conf.irc_host_af, start_serving=False )
 		### Other asyncio things should be initialized and started here
-		ircd_task = self.tasks.add(ircd.serve_forever())
+		tasks = [self.tasks.add(ircd.serve_forever())]
 		async with contextlib.AsyncExitStack() as ctx:
-			for blade in self.blades.values(): await ctx.enter_async_context(blade)
+			for blade in self.blades.values():
+				await ctx.enter_async_context(blade)
+				if blade._run_task: tasks.append(blade._run_task)
 			self.log.debug('Starting ircd...')
-			await ircd_task
+			await aio_loop(*tasks)
 			self.log.debug('Finished')
 
 	async def run_async(self):
@@ -1355,9 +1394,10 @@ class KelpBladeInterface:
 	# All underscored stuff here is for use by the bridge, while regular is for blades
 
 	lib = adict(
-		adict=adict, str_hash=str_hash, gai_bind=gai_bind,
+		adict=adict, err_fmt=err_fmt, str_hash=str_hash, gai_bind=gai_bind,
 		b64_encode=b64_encode, b64_decode=b64_decode,
-		aio_await_wrap=aio_await_wrap, aio_task_cancel=aio_task_cancel )
+		token_bucket=token_bucket, retries_within_timeout=retries_within_timeout,
+		aio_await_wrap=aio_await_wrap, aio_task_cancel=aio_task_cancel, aio_loop=aio_loop )
 	act_t = enum.Enum('act_t', 'names msg topic')
 
 	def __init__(self, name, kelp, blade_init):
@@ -1368,7 +1408,7 @@ class KelpBladeInterface:
 	async def __aenter__(self):
 		if self.enabled: return
 		self._prefix = self.bridge.uid('blade', self.name)
-		self._chan_map_func = self._chan_act_func = None
+		self._chan_map_func = self._chan_act_func = self._run_task = None
 		self._chan_names = irc_name_dict()
 		await self.blade.__aenter__()
 		self.enabled = True
@@ -1376,7 +1416,8 @@ class KelpBladeInterface:
 	async def __aexit__(self, *err):
 		if not self.enabled: return
 		await self.blade.__aexit__(*err)
-		self._chan_names = self._chan_map_func = self._chan_act_func = None
+		self._chan_names = self._chan_map_func = None
+		self._chan_act_func = self._run_task = None
 		self.enabled = False
 
 	async def _enabled(self, state=True):
@@ -1422,6 +1463,10 @@ class KelpBladeInterface:
 		# XXX: send JOIN/PART to all chan conns/bots
 		if join: chan.add(nick)
 		else: chan.discard(nick)
+
+	def reg_main_task(self, task):
+		'Register/replace run-task to be awaited indefinitely by the main loop.'
+		self._run_task = task
 
 	def send_msg(self, chan, nick, line, notice=False):
 		'Dispatch message/notice to specified channel from specified nick.'

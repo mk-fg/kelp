@@ -12,9 +12,9 @@ Python3/asyncio daemon to run personal ircd for hosting various other asyncio
 code - bots that'd populate its irc channels, most likely with line-based
 notifications and reports, as that's what this format is good for.
 
-Based on earlier rdircd_ daemon code and intended to replace `earlier twisted-based bot`_.
+Based on rdircd_ daemon code and intended to replace `earlier twisted-based bot`_.
 
-It's very much personal helper, so porbably only useful to me as-is,
+It's very much personal helper scripts, so probably only useful to me as-is,
 but feel free to use anything here that might be of value otherwise.
 
 .. _rdircd: https://github.com/mk-fg/reliable-discord-client-irc-daemon
@@ -76,7 +76,7 @@ jumps (e.g. due to failed delivery), does auth-encryption via pynacl, etc.
 
 Config sections:
 
-- udp-report-sink - see UDPRSConf.
+- udp-report-sink - see UDPRSConf in `udp-report-sink.py <blades/udp-report-sink.py>`_.
 
 - udp-report-sink-chans - channel to source nacl crypto_box pubkeys mapping.
 
@@ -85,7 +85,7 @@ Config sections:
   which will be dumped into this channel.
 
   Special "{chan}-topic" and "{chan}-nick" keys can be used to specify
-  topic/nick for each channel, otherwise defauls from udp-report-sink will be used.
+  topic/nick for each channel, otherwise defauls from UDPRSConf will be used.
 
 - udp-report-sink-keys
 
@@ -93,7 +93,68 @@ Config sections:
   (e.g. missing heartbeats, error count, etc) will have easy-to-read name
   instead of hard-to-remember keys.
 
-See blades/udp-report-send-test.py for an example of simple sender script.
+Example config for receiver from "some-key-for-A" pubkey into #alpha channel::
+
+  [udp-report-sink]
+  host = 0.0.0.0:1234
+  ;; uid-mask bits below should results in a
+	;;  pkt[:8] & 0x1008104104104104 == 0x100004100100 filter
+	;; Such filtering is to avoid auth-checking or logging random udp noise
+  uid-mask-intervals = 3, 9, 7, 6
+  uid-mask-bits = --x--xx-x-
+  cb_key = _p0ZbIHfK86H263_DBvaAbyrglrmqhcY0dOBppyPmgU=
+
+  [udp-report-sink-chans]
+  alpha = @some-key-for-A
+  alpha-topic = Reports from A
+  alpha-nick = reporterbot
+
+  [udp-report-sink-keys]
+  some-key-for-A = Msf_VdIGWquWN2SwCs9A4hDaE9rBUSkoxWiiOiLCQkY=
+
+See `udp-report-send-test.py <blades/udp-report-send-test.py>`_
+for an example of a simple sender script.
+
+logtail
+```````
+
+Plugin for tailing a log file (lines of text) in an efficient and reliable
+manner into irc channel, remembering last-reported position and handling
+rename-rotation (but NOT truncation).
+
+Uses inotify to monitor file(s) for updates and rotation, storing position
+and a checksum of last N bytes to a state-file with some rate-limiting
+for reads to batch-process frequent messages.
+
+Tailed files are assumed to become static after rotation (filename change)
+within specified timeout, after which they're closed and no longer monitored.
+
+Config sections:
+
+- logtail - see LogtailConf in `logtail.py <blades/logtail.py>`_.
+
+- logtail-files - mapping between monitored files and channels.
+
+  Each key is a channel name, values are space-separated file paths to monitor.
+  Weird filenames can be urlencoded (decoded via urllib.parse.unquote).
+
+  Special "{chan}-topic" and "{chan}-nick" keys can be used to specify
+  topic/nick for each channel, otherwise defauls from LogtailConf will be used.
+
+Example config for a couple logs to a #monitor channel with some parameters::
+
+  [logtail]
+  state-dir = /var/lib/kelp
+  read-interval-min = 0.3
+  post-rotate-timeout = 1.0
+
+  [logtail-files]
+  monitor = /var/log/nginx/errors.log /var/log/syslog.log
+  monitor-topic = App/system log tailer channel
+  monitor-nick = mon
+
+Files can be used as simple persistent queues for text messages from anywhere,
+and this tailer allows to use those for irc notifications.
 
 
 Requirements
