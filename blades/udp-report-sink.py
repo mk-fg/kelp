@@ -74,8 +74,8 @@ class UDPReportSink:
 		chan_map, self.chan_names, self.chan_keys = dict(), dict(), dict(chan_info)
 		chan_key_list, topic_base = dict(), self.conf.topic.format(conf=self.conf)
 		for k, v in sorted(self.chan_keys.items(), key=lambda kv: len(kv[0])):
-			if k.endswith('-topic'): chan_map[k[:-6]] = self.chan_keys.pop(k)
-			elif k.endswith('-nick'): self.chan_names[k[:-5]] = self.chan_keys.pop(k)
+			if k.endswith('.topic'): chan_map[k[:-6]] = self.chan_keys.pop(k)
+			elif k.endswith('.nick'): self.chan_names[k[:-5]] = self.chan_keys.pop(k)
 			else:
 				chan_map[k], self.chan_names[k] = topic_base, self.conf.nick
 				for pk in self.chan_keys.pop(k).split():

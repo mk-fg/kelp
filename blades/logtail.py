@@ -56,7 +56,7 @@ class INotify:
 	_INotifyEv = struct.Struct('iIII')
 	INotifyEv = cs.namedtuple( 'INotifyEv',
 		'path path_mask wd flags cookie name' )
-	INotifyEvTracker = cs.namedtuple('INotifyCtl', 'add rm ev_iter close')
+	INotifyEvTracker = cs.namedtuple('INotifyCtl', 'add rm ev_iter')
 
 	_libc = None
 	@classmethod
@@ -117,15 +117,12 @@ class INotify:
 			self._call('inotify_rm_watch', self.fd, wd)
 			self.wd_info.pop(wd)
 		async def ev_iter(dummy_first=True):
-			try:
-				if dummy_first: yield # for easy setup-on-first-iter in "async for"
-				while True:
-					ev = await queue.get()
-					if ev is None: break
-					yield ev
-			finally: queue.put_nowait(None)
-		def close(): queue.put_nowait(None)
-		return self.INotifyEvTracker(add, rm, ev_iter, close)
+			if dummy_first: yield # for easy setup-on-first-iter in "async for"
+			while True:
+				ev = await queue.get()
+				if ev is None: break
+				yield ev
+		return self.INotifyEvTracker(add, rm, ev_iter)
 
 
 class LogTailer:
@@ -144,8 +141,8 @@ class LogTailer:
 		chan_map, chan_files = dict(), cs.defaultdict(set)
 		self.file_chans, self.chan_names = cs.defaultdict(set), dict()
 		for k, v in sorted(self.iface.read_conf_section('logtail-files').items()):
-			if k.endswith('-topic'): chan_map[k[:-6]] = v
-			elif k.endswith('-nick'): self.chan_names[k[:-5]] = v.strip()
+			if k.endswith('.topic'): chan_map[k[:-6]] = v
+			elif k.endswith('.nick'): self.chan_names[k[:-5]] = v.strip()
 			elif fn_list := sorted(up.unquote(fn) for fn in v.split() if fn):
 				chan_map[k] = self.conf.topic.format(tail_files=' '.join(fn_list))
 				for fn in fn_list: self.file_chans[pl.Path(fn).resolve()].add(k)
@@ -156,7 +153,8 @@ class LogTailer:
 		self.iface.reg_main_task(self.run())
 
 	async def __aexit__(self, *err):
-		self.inotify.close()
+		self.file_state_dir = self.file_chans = self.chan_names = None
+		self.inotify = self.inotify.close()
 
 	def log_buff_repr(self, buff, n=120):
 		if len(buff := buff.strip()) > n:
@@ -278,7 +276,6 @@ class LogTailer:
 			if watch_fd: inotify.rm(watch_fd)
 			if watch_file: watch_file = watch_file.close()
 			if watch_file_state: watch_file_state = watch_file_state.close()
-			inotify.close()
 
 	def proc_file_updates(self, chan_set, buff):
 		'Dispatch any complete lines from buffer as msgs and return leftover bytes'

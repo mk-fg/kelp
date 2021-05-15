@@ -10,7 +10,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.10' # git-version: py-str
+	version = '1.11' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -267,8 +267,7 @@ def file_tail(p, n, grep=None, bs=100 * 2**10):
 def token_bucket(spec, negative_tokens=False):
 	'''Spec: { interval_seconds: float | float_a/float_b }[:burst_float]
 			Examples: 1/4:5 (interval=0.25s, rate=4/s, burst=5), 5, 0.5:10, 20:30.
-		Expects a number of tokens (can be float, default: 1)
-			and *always* subtracts these.
+		Expects a number of tokens (can be float, default: 1).
 		Yields either None if there's enough
 			tokens or delay (in seconds, float) until when there will be.'''
 	try:
