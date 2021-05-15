@@ -1,6 +1,6 @@
 import collections as cs, hashlib as hl, pathlib as pl
 import ctypes as ct, functools as ft, urllib.parse as up
-import os, sys, asyncio, enum, struct, errno, zlib, fcntl, termios
+import os, sys, asyncio, re, enum, struct, errno, zlib, fcntl, termios
 
 
 class LogtailConf:
@@ -152,8 +152,28 @@ class LogTailer:
 		for chan, nick in self.chan_names.items(): self.iface.reg_name(chan, nick)
 		self.iface.reg_main_task(self.run())
 
+		self.proc_rules = dict()
+		for k, v in self.iface.read_conf_section('logtail-files-proc').items():
+			try:
+				name, k = k.split('.', 1)
+				if k not in ['file', 're', 'sub', 'rate-tb', 'filter']: raise ValueError(k)
+			except ValueError: raise self.iface.error(f'Invalid processing-rule suffix: {k}')
+			if name not in self.proc_rules:
+				self.proc_rules[name] = self.iface.lib.adict(name=name)
+				self.proc_rules[name].update(dict.fromkeys('file re sub rate_tb filter'.split()))
+			if k == 'file': v = pl.Path(v).resolve()
+			elif k == 're': v = re.compile(v)
+			elif k == 'rate-tb': v = self.iface.lib.token_bucket(v)
+			elif k == 'filter': v = dict(whitelist=True, blacklist=False)[v.lower()]
+			self.proc_rules[name][k.replace('-', '_')] = v
+		for rule in self.proc_rules.values():
+			if not (rule.file and rule.re):
+				raise self.iface.error(f'Processing-rule missing required keys: {rule}')
+			if not (rule.sub is not None or rule.rate_tb or rule.filter is not None):
+				raise self.iface.error(f'Processing-rule without action: {rule}')
+
 	async def __aexit__(self, *err):
-		self.file_state_dir = self.file_chans = self.chan_names = None
+		self.file_state_dir = self.file_chans = self.chan_names = self.proc_rules = None
 		self.inotify = self.inotify.close()
 
 	def log_buff_repr(self, buff, n=120):
@@ -172,8 +192,9 @@ class LogTailer:
 
 	async def run_file_tailer(self, file_path, buff_cb):
 		'Handles tailing one file_path and calls "buff_leftover = buff_cb(buff)" on new data there.'
-		self.log.debug('Monitoring file: {}', file_path)
 		file_path_dir = file_path.parent
+		file_state_id = f'{self.iface.lib.str_hash(file_path_dir, 10)}.{file_path.name}'
+		self.log.debug('[{}] Monitoring file: {}', file_state_id, file_path)
 		watch_fd = watch_file = watch_buff = None
 		imf, loop, task = self.inotify.flags, asyncio.get_running_loop(), asyncio.current_task()
 		im_dir = imf.create | imf.moved_to
@@ -189,16 +210,20 @@ class LogTailer:
 					buff = watch_file.read(bs)
 					if not buff: break
 					watch_file_tail = ((watch_file_tail or b'') + buff)
-					watch_buff = buff_cb(watch_buff + buff)
+					try: watch_buff = buff_cb(watch_buff + buff)
+					except Exception as err:
+						self.log.exception( '[{}] Failed to process line-buffer (( {} )), dropping it: {}',
+							file_state_id, self.log_buff_repr(watch_buff + buff), self.iface.lib.err_fmt(err) )
+						watch_buff = b''
 					_watch_file_track()
 					if len(buff) != bs: break # EOF
 			except Exception as err:
-				self.log.exception('Failed to process file updates: {}', self.iface.lib.err_fmt(err))
+				self.log.exception( '[{}] Failed to process'
+					' file updates: {}', file_state_id, self.iface.lib.err_fmt(err) )
 				task.cancel()
 			finally: watch_file_timer = None
 
-		watch_file_state = self.file_state_dir / '{}.{}.state'.format(
-			self.iface.lib.str_hash(file_path_dir, 10), file_path.name )
+		watch_file_state = self.file_state_dir / f'{file_state_id}.state'
 		watch_file_state = os.fdopen(os.open(
 			watch_file_state, os.O_RDWR | os.O_CREAT, 0o600 ), 'r+b', 0)
 		watch_file_state_fmt = struct.Struct('>LHL') # (pos, len, adler32)
@@ -213,21 +238,23 @@ class LogTailer:
 					try: pos, tbs, cksum = watch_file_state_fmt.unpack(st)
 					except struct.error: pos = tbs = cksum = 0
 					if pos <= 0 or tbs <= 0:
-						self.log.warning( 'Corrupted last-file-position'
-							' state data, discarding it [ {} ]: {}', st.hex(), file_path )
+						self.log.warning( '[{}] Corrupted last-file-position'
+							' state data, discarding it [ {} ]: {}', file_state_id, st.hex(), file_path )
 					else:
 						watch_file.seek(max(0, pos - tbs))
-						# chunk_cksum = zlib.adler32(chunk := watch_file.read(tbs))
-						# self.log.debug( 'Chunk {} / {} B, {:o} {} {:o}: {!r}',
-						# 	len(chunk), tbs, cksum, '=' if cksum == chunk_cksum else '!=', chunk_cksum, chunk )
-						# if cksum != chunk_cksum:
-						if cksum != zlib.adler32(watch_file.read(tbs)):
-							self.log.warning( 'File contents mismatch at position'
-								' mark ({:,d} B), parsing file from the beginning: {}', pos, file_path )
-							watch_file.seek(0)
+						cksum_now = zlib.adler32(watch_file_tail := watch_file.read(tbs))
+						# self.log.debug( 'Chunk {} / {} B, {:o} {} {:o}: {!r}', len(watch_file_tail),
+						# 	tbs, cksum, '=' if cksum == cksum_now else '!=', cksum_now, watch_file_tail )
+						if cksum != cksum_now:
+							self.log.warning( '[{}] File contents mismatch at position mark'
+								' ({:,d} B), parsing file from the beginning: {}', file_state_id, pos, file_path )
+							watch_file_tail = watch_file.seek(0) and None
 			else:
 				pos = watch_file.tell() - (tl := len(watch_buff))
 				watch_file_tail = watch_file_tail[-(tbs+tl):]
+				# csum = zlib.adler32(chunk := watch_file_tail[:tbs])
+				# self.log.debug('File-state-tail {} / {} B, {:o}: {!r}', len(chunk), tbs, csum, chunk)
+				# watch_file_state.write(watch_file_state_fmt.pack(pos, tbs, csum))
 				watch_file_state.write( watch_file_state_fmt\
 					.pack(pos, tbs, zlib.adler32(watch_file_tail[:tbs])) )
 
@@ -264,8 +291,8 @@ class LogTailer:
 						_watch_file_process()
 						if loop.time() >= ts_deadline: break
 					if watch_buff:
-						self.log.warning( 'Incomplete last line at EOF'
-							' on closing watched file: {}', self.log_buff_repr(watch_buff) )
+						self.log.warning( '[{}] Incomplete last line at EOF'
+							' on closing file: {}', file_state_id, self.log_buff_repr(watch_buff) )
 					watch_file = watch_file_id = watch_file_tail = watch_buff = watch_file.close()
 					_watch_file_track()
 
@@ -277,20 +304,36 @@ class LogTailer:
 			if watch_file: watch_file = watch_file.close()
 			if watch_file_state: watch_file_state = watch_file_state.close()
 
-	def proc_file_updates(self, chan_set, buff):
-		'Dispatch any complete lines from buffer as msgs and return leftover bytes'
+	def proc_file_updates(self, p, chan_set, buff):
+		'Process/dispatch any complete lines from buffer as msgs and return leftover bytes'
 		try:
 			lines, buff = buff.rsplit(b'\n', 1)
 			lines = lines.decode(errors='replace')
-		except ValueError: pass
-		else:
-			for chan in chan_set: self.iface.send_msg(chan, self.chan_names[chan], lines)
+		except ValueError: return buff
+		for line in map(str.rstrip, lines.split('\n')):
+			for name, rule in self.proc_rules.items():
+				if rule.file != p: continue
+				m = rule.re.search(line)
+				if m:
+					if rule.sub: line = m.expand(rule.sub)
+					if rule.rate_tb:
+						block = next(rule.rate_tb)
+						if block:
+							if not rule.get('rate_tb_block'):
+								line += f'\n[started rate-limiting similar messages by rule: {name}]'
+							else: line = None
+						rule.rate_tb_block = block
+				if rule.filter is not None:
+					if bool(m) != rule.filter: line = None
+				if line is None: break
+			if line is not None:
+				for chan in chan_set: self.iface.send_msg(chan, self.chan_names[chan], line)
 		return buff
 
 	async def run(self):
 		self.log.debug('Starting infinite tailer-loops for {} file(s)...', len(self.file_chans))
 		await self.iface.lib.aio_loop(*(
-			self.run_file_tailer(p, ft.partial(self.proc_file_updates, chan_set))
+			self.run_file_tailer(p, ft.partial(self.proc_file_updates, p, chan_set))
 			for p, chan_set in self.file_chans.items() ))
 
 

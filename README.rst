@@ -84,7 +84,7 @@ Config sections:
   @name aliases (from udp-report-sink-keys secion) for all potential sources
   which will be dumped into this channel.
 
-  Special "{chan}-topic" and "{chan}-nick" keys can be used to specify
+  Special "{chan}.topic" and "{chan}.nick" keys can be used to specify
   topic/nick for each channel, otherwise defauls from UDPRSConf will be used.
 
 - udp-report-sink-keys
@@ -106,8 +106,8 @@ Example config for receiver from "some-key-for-A" pubkey into #alpha channel::
 
   [udp-report-sink-chans]
   alpha = @some-key-for-A
-  alpha-topic = Reports from A
-  alpha-nick = reporterbot
+  alpha.topic = Reports from A
+  alpha.nick = reporterbot
 
   [udp-report-sink-keys]
   some-key-for-A = Msf_VdIGWquWN2SwCs9A4hDaE9rBUSkoxWiiOiLCQkY=
@@ -138,8 +138,41 @@ Config sections:
   Each key is a channel name, values are space-separated file paths to monitor.
   Weird filenames can be urlencoded (decoded via urllib.parse.unquote).
 
-  Special "{chan}-topic" and "{chan}-nick" keys can be used to specify
+  Special "{chan}.topic" and "{chan}.nick" keys can be used to specify
   topic/nick for each channel, otherwise defauls from LogtailConf will be used.
+
+- logtail-files-proc - regexp-rules for processing individual log lines.
+
+  All rule keys start with arbitrary prefix to group multiple keys, and
+  dot-separated suffix after that determines purpose of the value,
+  similar to ".topic" and ".nick" for channels above.
+
+  Every rule must have ".file" value to set which file to apply it to,
+  and ".re" with python regexp to match each processed line.
+  Rules are applied in order they appear in and can affect each other.
+
+  Full list of supported rule-suffixes:
+
+  - file (required) - path used in logtail-files section to apply this rule to.
+
+  - re (required) - regexp to match against each line after str.rstrip()
+    (no tailing whitespace, newlines and such) to check if it should be affected
+    by this rule. In python's "re" module format.
+
+  - sub - substitution pattern, second argument to python's re.sub().
+
+  - rate-tb - token-bucket rate-limit applied to affected messages.
+
+    | Value format: ``{ interval_seconds: float | float_a/float_b }[:burst_float]``
+    | Examples: 1/4:5 (interval=0.25s, rate=4/s, burst=5), 5, 0.5:10, 20:30, 1/2.
+
+    Lines that go over the limit are skipped, with system message printed between
+    last passed and first skipped message to indicate when rate-limiting starts.
+
+  - filter - either "blacklist" or "whitelist" to silently drop either all
+    matching or non-matching lines respectively.
+
+  See example below for more info.
 
 Example config for a couple logs to a #monitor channel with some parameters::
 
@@ -150,8 +183,19 @@ Example config for a couple logs to a #monitor channel with some parameters::
 
   [logtail-files]
   monitor = /var/log/nginx/errors.log /var/log/syslog.log
-  monitor-topic = App/system log tailer channel
-  monitor-nick = mon
+  monitor.topic = App/system log tailer channel
+  monitor.nick = mon
+
+  [logtail-files-proc]
+
+  syslog-clean.file = /var/log/syslog.log
+  syslog-clean.re = ^[-\d]{10}T[:\d]{6}(\.\d+)?([-+]\d{2}:\d{2})? (?P<chan>[\w.]+)(<\d+>)? (?P<msg>.*)$
+  syslog-clean.sub = \g<chan> \g<msg>
+
+  syslog-selfnoise.file = /var/log/syslog.log
+  syslog-selfnoise.re = \skelp\[(\d+|-)\]@\w+:\s
+  syslog-selfnoise.rate-tb = 20
+
 
 Files can be used as simple persistent queues for text messages from anywhere,
 and this tailer allows to use those for irc notifications.

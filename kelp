@@ -10,7 +10,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.11' # git-version: py-str
+	version = '1.12' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -32,6 +32,7 @@ class KelpConfigBase:
 	irc_chan_modes = False # causes needless spam on ZNC reconnects
 
 	debug_verbose = False
+	debug_msg_echo = False
 	debug_msg_cut = 50
 	debug_proto_cut = 90
 	debug_proto_log_shared = True
@@ -266,7 +267,7 @@ def file_tail(p, n, grep=None, bs=100 * 2**10):
 
 def token_bucket(spec, negative_tokens=False):
 	'''Spec: { interval_seconds: float | float_a/float_b }[:burst_float]
-			Examples: 1/4:5 (interval=0.25s, rate=4/s, burst=5), 5, 0.5:10, 20:30.
+			Examples: 1/4:5 (interval=0.25s, rate=4/s, burst=5), 5, 0.5:10, 20:30, 1/2.
 		Expects a number of tokens (can be float, default: 1).
 		Yields either None if there's enough
 			tokens or delay (in seconds, float) until when there will be.'''
@@ -280,7 +281,7 @@ def token_bucket(spec, negative_tokens=False):
 			else: interval = float(a) / float(b)
 		if min(interval, burst) < 0: raise ValueError()
 	except: raise ValueError('Invalid format for rate-limit: {!r}'.format(spec))
-	# log.debug('tbf parameters: interval={:.1f}, burst={:.1f}', interval, burst)
+	# log_bak.debug('tbf parameters: interval={:,.2f}, burst={:,.1f}', interval, burst)
 	tokens, rate, ts_sync = burst, interval**-1, time.monotonic()
 	val = (yield) or 1
 	while True:
@@ -1392,6 +1393,7 @@ class KelpConfig(KelpConfigBase):
 class KelpBladeInterface:
 	# All underscored stuff here is for use by the bridge, while regular is for blades
 
+	error = KelpError
 	lib = adict(
 		adict=adict, err_fmt=err_fmt, str_hash=str_hash, gai_bind=gai_bind,
 		b64_encode=b64_encode, b64_decode=b64_decode,
@@ -1402,6 +1404,7 @@ class KelpBladeInterface:
 	def __init__(self, name, kelp, blade_init):
 		self.bridge, self.loop, self.conf = kelp, kelp.loop, kelp.conf
 		self.name, self.blade, self.enabled = name, blade_init(self), False
+		self._log = get_logger('kelp.echo')
 		self._chan_names = self._chan_map_func = self._chan_act_func = None
 
 	async def __aenter__(self):
@@ -1470,6 +1473,9 @@ class KelpBladeInterface:
 	def send_msg(self, chan, nick, line, notice=False):
 		'Dispatch message/notice to specified channel from specified nick.'
 		chan = self._chan_name(chan)
+		if self.conf.debug_msg_echo:
+			for ls in line.split('\n'):
+				self._log.debug('{} <{}> {}{}', chan, nick, notice and '[notice]' or '', ls.rstrip())
 		self.bridge.cmd_msg_blade(chan, nick, line, notice=notice)
 
 
