@@ -10,6 +10,7 @@ class LogtailConf:
 	read_interval_min = 0.1 # rate-limiting delay between update-processing events
 	post_rotate_timeout = 3.0 # time to wait between filename change detection and closing file
 	track_len = 120 # how many bytes to checksum for tracking position
+	inotify_sanity_check_interval = 709 # generate dummy events in case of bugs, 0 - disable
 
 	topic = 'logtail: {tail_files}'
 	nick = 'lot'
@@ -116,10 +117,13 @@ class INotify:
 		def rm(wd):
 			self._call('inotify_rm_watch', self.fd, wd)
 			self.wd_info.pop(wd)
-		async def ev_iter(dummy_first=True):
+		async def ev_iter(dummy_first=True, dummy_interval=None):
 			if dummy_first: yield # for easy setup-on-first-iter in "async for"
 			while True:
-				ev = await queue.get()
+				ev = queue.get()
+				if dummy_interval: ev = asyncio.wait_for(ev, dummy_interval)
+				try: ev = await ev
+				except asyncio.TimeoutError: ev = False
 				if ev is None: break
 				yield ev
 		return self.INotifyEvTracker(add, rm, ev_iter)
@@ -261,20 +265,24 @@ class LogTailer:
 		inotify = self.inotify.get_ev_tracker()
 		try:
 			watch_fd = inotify.add(file_path_dir, im_dir)
-			async for ev in inotify.ev_iter():
+			async for ev in inotify.ev_iter(
+					dummy_interval=self.conf.inotify_sanity_check_interval ):
 				# self.log.debug('inotify: {} {}', ev, ev and imf.unpack(ev.flags))
 
 				if not ev or ev.flags & im_dir:
 					if watch_file or not file_path.exists(): continue
-					# Switch to tracking file instead of parent-dir
-					watch_fd = inotify.rm(watch_fd)
-					watch_fd = inotify.add(file_path, im_file)
-					try:
-						watch_buff, watch_file = b'', file_path.open('rb')
-						ev, watch_file_id = None, self.file_stat_id(watch_file)
-					except OSError as err: # can fail when it's an old file that's being removed
-						if not err.errno & (errno.EACCES | errno.EAGAIN | errno.ENOENT): raise
+					watch_file_new = None
+					try: # switch to tracking file instead of parent-dir in all-or-nothing update
+						watch_file_new = file_path.open('rb')
+						state_update = [ ev and None, b'', watch_file_new,
+							self.file_stat_id(watch_file_new), inotify.add(file_path, im_file) ]
+					except FileNotFoundError:
+						if watch_file_new: watch_file_new.close()
 						continue
+					else:
+						watch_fd = inotify.rm(watch_fd)
+						ev, watch_buff, watch_file, watch_file_id, watch_fd = state_update
+					if ev is False: self.log.warning('BUG - dummy event triggered dir->file switch')
 				if ev and not ev.flags & im_file: raise ValueError(ev)
 				if not watch_file: continue # late file-events for already-closed file
 
@@ -282,8 +290,8 @@ class LogTailer:
 					# Close watch_file and switch back to tracking parent-dir
 					# Also wait for any ongoing writes to finish, process remaining tail here
 					if watch_file_timer: watch_file_timer = watch_file_timer.cancel()
-					watch_fd = inotify.rm(watch_fd)
-					watch_fd = inotify.add(file_path_dir, im_dir)
+					if ev is False: self.log.warning('BUG - dummy event triggered file rotation')
+					watch_fd = [inotify.add(file_path_dir, im_dir), inotify.rm(watch_fd)][0]
 					ts_deadline = loop.time() + self.conf.post_rotate_timeout
 					for delay in self.iface.lib\
 							.retries_within_timeout(4, self.conf.post_rotate_timeout):
