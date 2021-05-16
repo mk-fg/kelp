@@ -4,6 +4,10 @@ Kelp IRC Daemon
 .. contents::
   :backlinks: none
 
+.. image:: https://i.cbc.ca/1.5948104.1615583183!/fileImage/httpImage/image.jpg_gen/derivatives/original_1180/stunning-kelp-forests.jpg
+   :width: 70%
+   :align: center
+
 
 Description
 -----------
