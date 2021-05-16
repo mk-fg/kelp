@@ -10,7 +10,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.12' # git-version: py-str
+	version = '1.13' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -35,7 +35,7 @@ class KelpConfigBase:
 	debug_msg_echo = False
 	debug_msg_cut = 50
 	debug_proto_cut = 90
-	debug_proto_log_shared = True
+	debug_proto_log_shared = False
 	debug_proto_log_file = ''
 	debug_proto_log_file_size = int(1.5e6)
 	debug_proto_log_file_count = 9
