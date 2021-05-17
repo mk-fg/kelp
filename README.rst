@@ -5,7 +5,7 @@ Kelp IRC Daemon
   :backlinks: none
 
 .. image:: https://i.cbc.ca/1.5948104.1615583183!/fileImage/httpImage/image.jpg_gen/derivatives/original_1180/stunning-kelp-forests.jpg
-   :width: 70%
+   :width: 100%
    :align: center
 
 
@@ -102,8 +102,8 @@ Example config for receiver from "some-key-for-A" pubkey into #alpha channel::
   [udp-report-sink]
   host = 0.0.0.0:1234
   ;; uid-mask bits below should results in a
-	;;  pkt[:8] & 0x1008104104104104 == 0x100004100100 filter
-	;; Such filtering is to avoid auth-checking or logging random udp noise
+  ;;  pkt[:8] & 0x1008104104104104 == 0x100004100100 filter
+  ;; Such filtering is to avoid auth-checking or logging random udp noise
   uid-mask-intervals = 3, 9, 7, 6
   uid-mask-bits = --x--xx-x-
   cb_key = _p0ZbIHfK86H263_DBvaAbyrglrmqhcY0dOBppyPmgU=
@@ -178,7 +178,7 @@ Config sections:
 
   See example below for more info.
 
-Example config for a couple logs to a #monitor channel with some parameters::
+Example config for a couple logs to a #system channel with some parameters::
 
   [logtail]
   state-dir = /var/lib/kelp
@@ -186,9 +186,9 @@ Example config for a couple logs to a #monitor channel with some parameters::
   post-rotate-timeout = 1.0
 
   [logtail-files]
-  monitor = /var/log/nginx/errors.log /var/log/syslog.log
-  monitor.topic = App/system log tailer channel
-  monitor.nick = mon
+  system = /var/log/kmsg.log /var/log/syslog.log
+  system.topic = System log tailer channel
+  system.nick = mon
 
   [logtail-files-proc]
 
@@ -199,7 +199,6 @@ Example config for a couple logs to a #monitor channel with some parameters::
   syslog-selfnoise.file = /var/log/syslog.log
   syslog-selfnoise.re = \skelp\[(\d+|-)\]@\w+:\s
   syslog-selfnoise.rate-tb = 20
-
 
 Files can be used as simple persistent queues for text messages from anywhere,
 and this tailer allows to use those for irc notifications.
@@ -227,30 +226,34 @@ Last one will be updated wrt [state] and similar runtime stuff,
 so it can be useful to specify persistent config with auth and options,
 and separate (initially empty) one for such dynamic state.
 
-| E.g. ``./kelp -c config.ini -c state.ini`` will do that.
-| ``--conf-dump`` can be added to print resulting ini assembled from all these.
-|
+E.g. ``./kelp -c config.ini -c state.ini`` will do that.
+Adding ``--conf-dump`` option will print resulting ini assembled from all these.
 
 Frequent state timestamp updates are done in-place (small fixed-length values),
 but checking ctime before writes, so should be safe to tweak any of these files
 anytime anyway.
 
+If plugin stores runtime data in ini files, that should be mentioned in its docs.
+
 Channel Commands
 ````````````````
 
-In special channels like #control and #debug: send "h" or "help", see topic there.
+In special channels like #kelp.control and #kelp.debug:
+send "h" or "help", see topic there.
 
-Plugins can react to user messages as well, in their own ways.
+Plugins can react to user messages as well, in their own ways,
+which should be documented, if any.
 
 Aliases
 ```````
 
 Can be defined in the config file to replace hash-based IDs with something
-easily readable::
+more easily readable::
 
   [aliases]
-  blade.cSug = urs
+  blade.csug = logs
 
-(to turn e.g. #cSug.info into #urs.info)
+(to turn e.g. #csug.system into #logs.system, and same for other channels of
+that plugin)
 
 Currently only implemented for Blade UIDs in IRC channel names.
