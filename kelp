@@ -10,7 +10,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.13' # git-version: py-str
+	version = '1.14' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -443,7 +443,7 @@ class IRCProtocol:
 		self.log = get_logger(f'kelp.irc.{conn_id}')
 		self.log.debug('Connection from {} {} [{}]', host, port, conn_id)
 		self.transport, self.st.host = tr, host
-		self.send('NOTICE * :*** kelp ircd ready')
+		self.send(0, 'NOTICE * :*** kelp ircd ready')
 		self.bridge.irc_conn_new(self)
 		self.bridge.cmd_delay(self.recv_queue_proc)
 
@@ -452,7 +452,7 @@ class IRCProtocol:
 		while b'\n' in self.buff:
 			line, self.buff = self.buff.split(b'\n', 1)
 			if not line.strip(): continue
-			line_len, line_repr = self._repr(line, True)
+			line_len, line_repr = self._repr_bin(line, True)
 			self.log_proto.debug( '<<  [{} {}] {}',
 				self.st.nick or '---', line_len, line_repr, extra=('<< ', line) )
 			if not line.strip(): continue
@@ -469,13 +469,13 @@ class IRCProtocol:
 		self.bridge.irc_conn_lost(self)
 
 	def data_send(self, data):
-		data_len, data_repr = self._repr(data, True)
+		data_len, data_repr = self._repr_bin(data, True)
 		self.log_proto.debug( ' >> [{} {}] {}',
 			self.st.nick or '---', data_len, data_repr, extra=(' >>', data) )
 		self.transport.write(data)
 
 
-	def _repr(self, data, prefix=False, max_len=None, ext=' [{data_len}]'):
+	def _repr_bin(self, data, prefix=False, max_len=None, ext=' [{data_len}]'):
 		'Binary-only version of str_repr().'
 		if isinstance(data, str): data = data.encode()
 		if max_len is None: max_len = self.conf.debug_proto_cut
@@ -512,8 +512,9 @@ class IRCProtocol:
 
 	def send(self, line_or_code, *args, max_len=None, auto_split=True):
 		line = line_or_code
-		if isinstance(line, int):
-			line = f':{self.bridge.server_host} {line:03d} {self.st.nick or "*"}'
+		if isinstance(line, int): # code=0 only adds :host prefix
+			code, line = line, f':{self.bridge.server_host}'
+			if code: line += f' {code:03d} {self.st.nick or "*"}'
 		if args: line += ' ' + ' '.join(map(str, args))
 		if isinstance(line, str): line = line.encode()
 		if max_len is None: max_len = self.conf.irc_len_hwm
@@ -523,7 +524,7 @@ class IRCProtocol:
 				m = self._parse(line)
 				if m.cmd in ['privmsg', 'notice']: return self.send_split_msg(m)
 			if len(line) > max_len:
-				self.log.info('Sending line with >{}B: {!r}', max_len, self._repr(line))
+				self.log.info('Sending line with >{}B: {!r}', max_len, self._repr_bin(line))
 		if b'\n' in line: raise IRCProtocolError(f'Line with newlines: {line!r}')
 		line += b'\r\n'
 		self.data_send(line)
@@ -558,10 +559,10 @@ class IRCProtocol:
 		else:
 			try: line = line_raw.decode().strip()
 			except UnicodeDecodeError:
-				return self.log.error('Failed to decode line as utf-8: {!r}', self._repr(line_raw))
+				return self.log.error('Failed to decode line as utf-8: {!r}', self._repr_bin(line_raw))
 		try: m = self._parse(line)
 		except IRCProtocolLineError:
-			return self.log.error('Line protocol error: {!r}', self._repr(line_raw))
+			return self.log.error('Line protocol error: {!r}', self._repr_bin(line_raw))
 		cmd_cache = self._cmd_cache.get(m.cmd)
 		if cmd_cache: cmd_func, cmd_ps_n = cmd_cache
 		else:
@@ -573,16 +574,16 @@ class IRCProtocol:
 				else: cmd_ps_n = cmd_ps_n - sum(1 for p in args if p.default is not p.empty), cmd_ps_n
 			self._cmd_cache[m.cmd] = cmd_func, cmd_ps_n
 		if not cmd_func:
-			self.log.error('Unhandled cmd: {!r}', self._repr(line_raw))
+			self.log.error('Unhandled cmd: {!r}', self._repr_bin(line_raw))
 			return self.send(421, ':Unknown command')
 		if not self.check_access(m.cmd):
-			return self.log.error('Out-of-order cmd: {!r}', self._repr(line_raw))
+			return self.log.error('Out-of-order cmd: {!r}', self._repr_bin(line_raw))
 		if cmd_ps_n is None: await aio_await_wrap(cmd_func(m))
 		else:
 			(a, b), n = cmd_ps_n, len(m.params)
 			if not a <= n <= b:
 				self.log.error( 'Command/args'
-					' mismatch [{} vs {}-{}]: {!r}', n, a, b, self._repr(line) )
+					' mismatch [{} vs {}-{}]: {!r}', n, a, b, self._repr_bin(line) )
 				return self.send(461, ':Incorrect command parameters')
 			try: await aio_await_wrap(cmd_func(*m.params))
 			except Exception as err:
@@ -614,14 +615,14 @@ class IRCProtocol:
 	def recv_cmd_cap(self, sub, caps=''):
 		sub = sub.lower()
 		if sub == 'ls':
-			self.send('CAP * LS :')
+			self.send(0, 'CAP * LS :')
 			if caps == '302': self.st.cap_neg = True
-		elif sub == 'list': self.send('CAP * LIST :')
+		elif sub == 'list': self.send(0, f'CAP * LIST :')
 		elif sub == 'req':
 			self.st.cap_neg = True
 			reject = set(c for c in caps.split() if not c.startswith('-'))
-			if reject: self.send(f'CAP * NAK :{caps}')
-			else: self.send(f'CAP * ACK :{caps}')
+			if reject: self.send(0, f'CAP * NAK :{caps}')
+			else: self.send(0, f'CAP * ACK :{caps}')
 		elif sub == 'end': self.st.cap_neg = False
 
 	def recv_cmd_pass(self, pw):
@@ -653,7 +654,7 @@ class IRCProtocol:
 					hashlib.blake2b((self.st.pw or '').encode(), salt=salt).digest() ):
 				return self.send(464, ':Password incorrect')
 		self.st.auth = True
-		self.send('NOTICE * :*** registration completed')
+		self.send(0, 'NOTICE * :*** registration completed')
 		self.send(1, f':Welcome to the kelp ircd, {self.st.nick}')
 		self.send(2,
 			f':Your host is {self.bridge.server_host},'
@@ -788,7 +789,7 @@ class IRCProtocol:
 			names = self.bridge.cmd_chan_names(c.name)
 			topic = str_repr(c.topic, max_len=self.conf.irc_len_topic, len_bytes=True)
 			self.send(322, self.chan_spec(c.name), len(names), f':{topic}')
-		self.send(321, ':End of /LIST')
+		self.send(323, ':End of /LIST')
 
 	def recv_cmd_motd(self, target=None): self.send_motd()
 
@@ -870,7 +871,6 @@ class Kelp:
 	def __init__(self, loop, conf):
 		self.loop, self.conf, self.init, self.blades = loop, conf, None, dict()
 		self.log = get_logger('kelp.bridge')
-		self._repr = ft.partial(str_repr, max_len=self.conf.debug_msg_cut)
 
 	async def __aenter__(self):
 		self.server_ver = self.conf.version
