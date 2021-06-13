@@ -314,10 +314,9 @@ class LogTailer:
 
 	def proc_file_updates(self, p, chan_set, buff):
 		'Process/dispatch any complete lines from buffer as msgs and return leftover bytes'
-		try:
-			lines, buff = buff.rsplit(b'\n', 1)
-			lines = lines.decode(errors='replace')
+		try: lines, buff = buff.rsplit(b'\n', 1)
 		except ValueError: return buff
+		lines = lines.decode(errors='replace')
 		for line in map(str.rstrip, lines.split('\n')):
 			for name, rule in self.proc_rules.items():
 				if rule.file != p: continue
