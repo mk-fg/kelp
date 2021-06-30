@@ -10,7 +10,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.15' # git-version: py-str
+	version = '1.16' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''

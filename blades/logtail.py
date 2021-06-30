@@ -84,8 +84,7 @@ class INotify:
 	def close(self):
 		for path, mask, queue in self.wd_info.values(): queue.put_nowait(None)
 		asyncio.get_running_loop().remove_reader(self.fd)
-		os.close(self.fd)
-		self.fd = self.wd_info = None
+		self.fd = self.wd_info = os.close(self.fd)
 	async def __aenter__(self): return self.open()
 	async def __aexit__(self, *err): self.close()
 
@@ -115,8 +114,10 @@ class INotify:
 			self.wd_info[wd] = path, mask, queue
 			return wd
 		def rm(wd):
-			self._call('inotify_rm_watch', self.fd, wd)
-			self.wd_info.pop(wd)
+			if self.fd:
+				self._call('inotify_rm_watch', self.fd, wd)
+				self.wd_info.pop(wd)
+			os.close(wd)
 		async def ev_iter(dummy_first=True, dummy_interval=None):
 			if dummy_first: yield # for easy setup-on-first-iter in "async for"
 			while True:
@@ -196,14 +197,13 @@ class LogTailer:
 
 	async def run_file_tailer(self, file_path, buff_cb):
 		'Handles tailing one file_path and calls "buff_leftover = buff_cb(buff)" on new data there.'
-		file_path_dir = file_path.parent
+		file_path_dir = file_path.resolve().parent
 		file_state_id = f'{self.iface.lib.str_hash(file_path_dir, 10)}.{file_path.name}'
 		self.log.debug('[{}] Monitoring file: {}', file_state_id, file_path)
-		watch_fd = watch_file = watch_buff = None
-		imf, loop, task = self.inotify.flags, asyncio.get_running_loop(), asyncio.current_task()
-		im_dir = imf.create | imf.moved_to
-		im_file = imf.modify | imf.move_self | imf.close_write | imf.delete_self
+		imf, inn = self.inotify.flags, self.inotify.get_ev_tracker()
+		loop, task = asyncio.get_running_loop(), asyncio.current_task()
 
+		watch_file = watch_buff = None
 		watch_file_tail = watch_file_init = watch_file_timer = None
 		def _watch_file_process(bs=self.conf.read_size):
 			'Called when any new data might be appended to a file'
@@ -213,7 +213,7 @@ class LogTailer:
 				while True:
 					buff = watch_file.read(bs)
 					if not buff: break
-					watch_file_tail = ((watch_file_tail or b'') + buff)
+					watch_file_tail = (watch_file_tail or b'') + buff
 					try: watch_buff = buff_cb(watch_buff + buff)
 					except Exception as err:
 						self.log.exception( '[{}] Failed to process line-buffer (( {} )), dropping it: {}',
@@ -262,39 +262,32 @@ class LogTailer:
 				watch_file_state.write( watch_file_state_fmt\
 					.pack(pos, tbs, zlib.adler32(watch_file_tail[:tbs])) )
 
-		inotify = self.inotify.get_ev_tracker()
+		fn, watch_fd = file_path.name, inn.add(file_path.parent, imf.modify)
 		try:
-			watch_fd = inotify.add(file_path_dir, im_dir)
-			async for ev in inotify.ev_iter(
+			async for ev in inn.ev_iter(
 					dummy_interval=self.conf.inotify_sanity_check_interval ):
+				if ev and ev.name != fn: continue # changes in other files
 				# self.log.debug('inotify: {} {}', ev, ev and imf.unpack(ev.flags))
 
-				if not ev or ev.flags & im_dir:
-					if watch_file or not file_path.exists(): continue
-					watch_file_new = None
-					try: # switch to tracking file instead of parent-dir in all-or-nothing update
+				if not watch_file:
+					if not file_path.exists(): continue
+					watch_file_new = self.log.debug('Opening log file: {}', file_path.name)
+					try:
 						watch_file_new = file_path.open('rb')
-						state_update = [ ev and None, b'', watch_file_new,
-							self.file_stat_id(watch_file_new), inotify.add(file_path, im_file) ]
+						watch_file_new_id = self.file_stat_id(watch_file_new)
 					except FileNotFoundError:
 						if watch_file_new: watch_file_new.close()
-						continue
+						continue # old/repeated event
 					else:
-						watch_fd = inotify.rm(watch_fd)
-						ev, watch_buff, watch_file, watch_file_id, watch_fd = state_update
-					if ev is False: self.log.warning('BUG - dummy event triggered dir->file switch')
-				if ev and not ev.flags & im_file: raise ValueError(ev)
-				if not watch_file: continue # late file-events for already-closed file
-
-				if self.file_stat_id(file_path) != watch_file_id: # file was rotated
-					# Close watch_file and switch back to tracking parent-dir
-					# Also wait for any ongoing writes to finish, process remaining tail here
+						ev, watch_buff, watch_file, watch_file_id = (
+							ev and None, b'', watch_file_new, watch_file_new_id )
+				elif self.file_stat_id(file_path) != watch_file_id: # file was rotated
+					# Wait for any ongoing writes to finish, process remaining tail here
+					# Not tracking close_write as there can potentially be multiple writers
 					if watch_file_timer: watch_file_timer = watch_file_timer.cancel()
 					if ev is False: self.log.warning('BUG - dummy event triggered file rotation')
-					watch_fd = [inotify.add(file_path_dir, im_dir), inotify.rm(watch_fd)][0]
 					ts_deadline = loop.time() + self.conf.post_rotate_timeout
-					for delay in self.iface.lib\
-							.retries_within_timeout(4, self.conf.post_rotate_timeout):
+					for delay in self.iface.lib.retries_within_timeout(4, self.conf.post_rotate_timeout):
 						await asyncio.sleep(delay)
 						_watch_file_process()
 						if loop.time() >= ts_deadline: break
@@ -302,13 +295,14 @@ class LogTailer:
 						self.log.warning( '[{}] Incomplete last line at EOF'
 							' on closing file: {}', file_state_id, self.log_buff_repr(watch_buff) )
 					watch_file = watch_file_id = watch_file_tail = watch_buff = watch_file.close()
-					_watch_file_track()
+					_watch_file_track() # reset tracking pos
+					continue
 
-				elif not watch_file_timer: # schedule/delay processing file updates
+				if not watch_file_timer: # schedule/delay processing file updates
 					watch_file_timer = loop.call_later(self.conf.read_interval_min, _watch_file_process)
 
 		finally:
-			if watch_fd: inotify.rm(watch_fd)
+			inn.rm(watch_fd)
 			if watch_file: watch_file = watch_file.close()
 			if watch_file_state: watch_file_state = watch_file_state.close()
 
