@@ -11,6 +11,8 @@ class LogtailConf:
 	post_rotate_timeout = 3.0 # time to wait between filename change detection and closing file
 	track_len = 120 # how many bytes to checksum for tracking position
 	inotify_sanity_check_interval = 709 # generate dummy events in case of bugs, 0 - disable
+	old_log_suff = '.1 .0 .old .bak' # warn about writes to unmonitored files with these
+	old_log_suff_notify_interval = 600
 
 	topic = 'logtail: {tail_files}'
 	nick = 'lot'
@@ -263,10 +265,15 @@ class LogTailer:
 					.pack(pos, tbs, zlib.adler32(watch_file_tail[:tbs])) )
 
 		fn, watch_fd = file_path.name, inn.add(file_path.parent, imf.modify)
+		fn_old_ts, fn_old_set = 0, set(f'{fn}{suff}' for suff in self.conf.old_log_suff.split())
 		try:
 			async for ev in inn.ev_iter(
 					dummy_interval=self.conf.inotify_sanity_check_interval ):
-				if ev and ev.name != fn: continue # changes in other files
+				if ev and ev.name != fn: # changes in other files
+					if ( ev.name not in fn_old_set or
+						fn_old_ts > loop.time() - self.conf.old_log_suff_notify_interval ): continue
+					self.log.warning('Detected writes to old/rotated log file: {}', file_path_dir / ev.name)
+					fn_old_ts = loop.time()
 				# self.log.debug('inotify: {} {}', ev, ev and imf.unpack(ev.flags))
 
 				if not watch_file:
@@ -282,7 +289,7 @@ class LogTailer:
 						ev, watch_buff, watch_file, watch_file_id = (
 							ev and None, b'', watch_file_new, watch_file_new_id )
 				elif self.file_stat_id(file_path) != watch_file_id: # file was rotated
-					# Wait for any ongoing writes to finish, process remaining tail here
+					# Wait for any pending writes to finish, process remaining tail here
 					# Not tracking close_write as there can potentially be multiple writers
 					if watch_file_timer: watch_file_timer = watch_file_timer.cancel()
 					if ev is False: self.log.warning('BUG - dummy event triggered file rotation')
