@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 
 import itertools as it, operator as op, functools as ft
+import collections as cs, collections.abc as cs_abc, datetime as dt
+import pathlib as pl, contextlib as cl, hashlib as hl
 import os, sys, stat, re, time, secrets, json, enum
-import contextlib, asyncio, socket, signal, inspect, traceback
-import hashlib, base64, unicodedata, configparser, tempfile, runpy
-import collections as cs, collections.abc as cs_abc, datetime as dt, pathlib as pl
+import asyncio, socket, signal, inspect, traceback
+import base64, unicodedata, configparser, tempfile, runpy
 import logging, logging.handlers
 
 
 class KelpConfigBase:
 
-	version = '1.17' # git-version: py-str
+	version = '1.18' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -20,6 +21,7 @@ class KelpConfigBase:
 	irc_password = ''
 	irc_host_af = 0
 	irc_auth_tbf = '30:8'
+	irc_motd_file_path = '' # file path to read for motd command
 
 	irc_len_hwm = 450 # will probably still work with most clients
 	irc_len_lwm = 300
@@ -55,7 +57,9 @@ err_fmt = lambda err: '[{}] {}'.format(err.__class__.__name__, err)
 
 class LogMessage:
 	def __init__(self, fmt, a, k): self.fmt, self.a, self.k = fmt, a, k
-	def __str__(self): return self.fmt.format(*self.a, **self.k) if self.a or self.k else self.fmt
+	def __str__(self):
+		return ( self.fmt.format(*self.a, **self.k)
+			if self.a or self.k else self.fmt ).replace('\n', ' ⏎ ')
 
 class LogStyleAdapter(logging.LoggerAdapter):
 	def __init__(self, logger, extra=None): super().__init__(logger, extra or {})
@@ -95,12 +99,15 @@ class LogProtoDebugFilter(logging.Filter):
 log_proto_debug_filter = LogProtoDebugFilter()
 
 class LogProtoFormatter(logging.Formatter):
-	last_ts = last_rec = last_reltime = None
+	last_ts = last_reltime = None
 	def format(self, record):
-		if id(record) != self.last_rec:
-			reltime = (record.created - self.last_ts) if self.last_ts else 0
-			self.last_reltime = '{}{:,.3f}'.format('+' if reltime >= 0 else '', reltime)
-			self.last_ts, self.last_rec = record.created, id(record)
+		# LogRecords coming here tend to be duplicated, as handler is
+		#  attached to multiple loggers, e.g. irc.conn + proto.irc.conn
+		# So to track relative timestamps, such same-time duplicates have to be skipped
+		if record.created != self.last_ts: # new (non-dupe) record
+			self.last_ts, reltime = ( record.created,
+				(record.created - self.last_ts) if self.last_ts else 0 )
+			self.last_reltime = '{:>7s}'.format(f'{"+" if reltime >= 0 else ""}{reltime:,.3f}')
 		record.reltime = self.last_reltime
 		record.asctime = time.strftime(
 			'%Y-%m-%dT%H:%M:%S', time.localtime(record.created) )
@@ -198,7 +205,7 @@ def gai_bind(proto, bind, port='', family=0, log=None):
 
 def str_hash(s, c=None, key='kelp-1'):
 	s = b64_encode(
-			hashlib.blake2s(str(s).encode(), key=key.encode()).digest() )\
+			hl.blake2s(str(s).encode(), key=key.encode()).digest() )\
 		.replace('-', '').replace('_', '').replace('=', '')
 	if c is None: return s
 	if len(s) < c: s = str_hash(s, c, key)
@@ -228,7 +235,7 @@ def dict_update(d, du_iter=None, sync=True):
 	d.update(du)
 	if sync: return dict((k, d.pop(k)) for k in keys_old.difference(du))
 
-@contextlib.contextmanager
+@cl.contextmanager
 def safe_replacement(path, *open_args, mode=None, **open_kws):
 	path = str(path)
 	if mode is None:
@@ -315,9 +322,9 @@ async def aio_task_cancel(task_list):
 	if inspect.isawaitable(task_list): task_list = [task_list]
 	task_list = list(filter(None, task_list))
 	for task in task_list:
-		with contextlib.suppress(asyncio.CancelledError): task.cancel()
+		with cl.suppress(asyncio.CancelledError): task.cancel()
 	for task in task_list:
-		with contextlib.suppress(asyncio.CancelledError): await task
+		with cl.suppress(asyncio.CancelledError): await task
 
 async def aio_loop(*tasks, gc_only=False):
 	'Poll/Cancel/await loop-tasks, which are never supposed to return.'
@@ -430,7 +437,7 @@ class IRCProtocol:
 			chans=irc_name_dict() )
 		if self.conf.irc_password:
 			salt = os.urandom(8)
-			self.st.pw_hash = salt, hashlib.blake2b(
+			self.st.pw_hash = salt, hl.blake2b(
 				self.conf.irc_password.encode(), salt=salt ).digest()
 
 
@@ -610,7 +617,7 @@ class IRCProtocol:
 
 
 	def recv_cmd_ping(self, server, server_dst=None):
-		self.send(f'PONG {self.bridge.server_host}')
+		self.send(0, f'PONG {self.bridge.server_host} :{server}')
 
 	def recv_cmd_cap(self, sub, caps=''):
 		sub = sub.lower()
@@ -651,7 +658,7 @@ class IRCProtocol:
 		if self.st.pw_hash:
 			salt, pw_hash = self.st.pw_hash
 			if not secrets.compare_digest( pw_hash,
-					hashlib.blake2b((self.st.pw or '').encode(), salt=salt).digest() ):
+					hl.blake2b((self.st.pw or '').encode(), salt=salt).digest() ):
 				return self.send(464, ':Password incorrect')
 		self.st.auth = True
 		self.send(0, 'NOTICE * :*** registration completed')
@@ -687,7 +694,15 @@ class IRCProtocol:
 		self.send( 266, f'{s.total} {s.total_max}',
 			f':Current global users {s.total}, max {s.total_max}' )
 
-	def send_motd(self): self.send(422, ':MOTD File is missing')
+	def send_motd(self):
+		motd = self.conf.irc_motd_file_path
+		if motd:
+			try: motd = pl.Path(self.conf.irc_motd_file_path).read_text()
+			except FileNotFoundError: motd = ''
+		if not motd: return self.send(422, ':MOTD File is missing')
+		self.send(375, f':- {self.bridge.server_host} Message of the day -')
+		for line in motd.splitlines(): self.send(372, f':- {line}')
+		self.send(376, ':End of /MOTD command')
 
 	def recv_cmd_quit(self, reason=None):
 		self.send('QUIT :Client quit')
@@ -944,7 +959,7 @@ class Kelp:
 			family=self.conf.irc_host_af, start_serving=False )
 		### Other asyncio things should be initialized and started here
 		tasks = [self.tasks.add(ircd.serve_forever())]
-		async with contextlib.AsyncExitStack() as ctx:
+		async with cl.AsyncExitStack() as ctx:
 			for blade in self.blades.values():
 				await ctx.enter_async_context(blade)
 				if blade._run_task: tasks.append(blade._run_task)
@@ -1004,7 +1019,7 @@ class Kelp:
 	def cmd_chan_conns(self, name):
 		return list(
 			conn for conn in self.irc_conns.values()
-			if conn.chan_name(name) in conn.st.chans )
+			if conn.st.auth and conn.chan_name(name) in conn.st.chans )
 
 	def cmd_chan_names(self, name):
 		conn_nicks = irc_name_dict.value_map(
@@ -1080,7 +1095,7 @@ class Kelp:
 
 	def cmd_chan_sys_debug(self, conn, chan, line):
 		line_src, line = line, line.strip().lower().split()
-		pt_n, pt_cut = (getattr(self.conf, f'debug_chan_proto_{k}') for k in ['tail', 'cut'])
+		pt_n, pt_cut = (self.conf.get(f'debug_chan_proto_{k}') for k in ['tail', 'cut'])
 		if not line: return
 		send = ft.partial(conn.cmd_msg_synth, self.nick_sys, chan)
 		if line[0] in ['h', 'help', 'st', 'status']:
@@ -1106,13 +1121,14 @@ class Kelp:
 				'    That mostly adds connection stuff - disconnects, reconnects, auth, etc.',
 				'  level debug - (alias: d) enable level=debug logging in this channel',
 				'    Includes protocol info (if shared), events, messages and everything else.',
+				'  level error, level critical - more quiet than other levels above',
 				'  proto {file} - enable irc/discord protocol logging to specified file',
 				'  proto off - (alias: px) disable irc/discord protocol logging',
 				'  proto share/unshare - (alias: ps/pu)',
 				'    whether to dump protocol logging (level=debug) to regular logs',
 				f'  proto tail [n] [cut] - (alias: pt) dump "n" (default={pt_n}) tail lines',
 				f'    of protocol log file (if enabled), limited to "cut" length (default={pt_cut}).' ]))
-		with contextlib.suppress(KeyError):
+		with cl.suppress(KeyError):
 			line = dict(
 				i='level info', d='level debug', w='level warning',
 				px='proto off', ps='proto share',
@@ -1121,9 +1137,10 @@ class Kelp:
 		if cmd == 'level' and len(line) == 2:
 			level = getattr(logging, arg.upper(), None)
 			if level is not None and self.conf._debug_chan:
+				arg_old = logging.getLevelName(self.conf._debug_chan.level)
 				self.conf._debug_chan.setLevel(level)
-			else: arg = 'unavailable'
-			send(f'-- logging level: {arg}')
+				send(f'-- logging level: {arg_old.lower()} -> {arg.lower()}')
+			else: send(f'-- failed to change logging level: level or logger unavailable')
 		elif cmd == 'proto':
 			if arg == 'off':
 				if self.conf._debug_proto:
@@ -1187,13 +1204,10 @@ class Kelp:
 
 class KelpConfig(KelpConfigBase):
 
-	state_tracked, state, aliases = True, None, None
-	_state_section = _state_offsets = _state_file = _state_file_ts = None
+	aliases = None
 	_debug_chan = _debug_proto = _debug_counts = None
 
-	def __init__(self):
-		self.state, self.aliases = dict(), dict()
-		self.log = get_logger('kelp.state')
+	def __init__(self): self.aliases = dict()
 
 	def __repr__(self): return repr(vars(self))
 	def get(self, *k): return getattr(self, '_'.join(k))
@@ -1212,6 +1226,7 @@ class KelpConfig(KelpConfigBase):
 			if cat_chk != cat:
 				cat = cat_chk
 				print(f'\n[{cat}]')
+			if v and isinstance(v, str) and v[-1] in ' \t': v += '\\'
 			if isinstance(v, bool): v = ['no', 'yes'][v]
 			k = m.group(2).replace('_', '-')
 			print(f'{k} = {v}')
@@ -1240,7 +1255,12 @@ class KelpConfig(KelpConfigBase):
 			elif k.startswith('_'): continue
 			else: conf_k = k
 			v = getattr(conf, conf_k)
-			if isinstance(v, str): get_val = lambda *a: str(parser.get(*a, raw=True))
+			if isinstance(v, str):
+				def get_val(*a):
+					v = str(parser.get(*a, raw=True))
+					if v.endswith('\\'): v = v[:-1]
+					if len(v) >= 2 and v[0] == '\\' and v[1] in ' \t': v = v[1:]
+					return v
 			elif isinstance(v, bool): get_val = parser.getboolean
 			elif isinstance(v, int): get_val = lambda *a: int(re.sub(r'[ _]', '', parser.get(*a)))
 			elif isinstance(v, float): get_val = lambda *a: float(parser.get(*a))
@@ -1255,11 +1275,6 @@ class KelpConfig(KelpConfigBase):
 		for k in self._conf_sections:
 			self.update_from_file_section(self, parser, section=k, prefix=f'{k}_')
 		self.read(self, parser.getboolean, 'state', 'tracked')
-		self._state_section = parser.has_section('state')
-		if self.state_tracked and self._state_section:
-			for k, v in parser['state'].items():
-				if k == 'tracked': continue
-				self.state[k] = parse_iso8601(v)
 		if parser.has_section('aliases'):
 			for k, v in parser['aliases'].items():
 				if '.' not in k: continue
@@ -1309,85 +1324,6 @@ class KelpConfig(KelpConfigBase):
 			for k, (v, rx) in keys.items():
 				if v is None: continue
 				dst.write(f'{k} = {v}\n')
-		self._state_source_flush()
-
-	### Timestamps in [state] section are updated in-place,
-	###  overwriting short timestamp values without tmp files.
-	### File should be safe to edit manually regardless, due to ctime checks.
-
-	def _state_source_flush(self):
-		self._state_file = self._state_offsets = None
-
-	def _state_source_get(self):
-		if self._state_file and self._state_file_ts:
-			try: ts = os.stat(self._state_file.name).st_ctime
-			except OSError: ts = None
-			if ts != self._state_file_ts: self._state_source_flush()
-		if not self._state_file: self._state_file = open(self._conf_path, 'rb+')
-		if self._state_offsets is None: self._state_offsets = self._state_offsets_read()
-		return self._state_file, self._state_offsets
-
-	def _state_offsets_read(self, section='state'):
-		section, src = section.replace('_', '-'), self._state_file
-		sec_re, sec_k = re.compile(r'(?i)^\[\s*(\S+)\s*\]$'), str_norm(section)
-		src.seek(0)
-		offsets, parse = dict(), False
-		val_re = re.compile(b'^\s*([\w\d]\S+)\s*=\s*(\S+)\s*$')
-		for line in iter(src.readline, b''):
-			m = sec_re.search(line.decode().strip())
-			if m:
-				k = str_norm(m.group(1))
-				if k == sec_k: parse = True
-				else: parse = False
-				continue
-			if parse:
-				m = val_re.search(line)
-				if not m: continue
-				k, v = m.group(1), m.group(2)
-				pos = src.tell() - len(line) + m.start(2)
-				offsets[k.decode()] = pos
-				# src.seek(pos)
-				# v_chk = src.read(len(v))
-				# assert v_chk == v, [pos, v_chk, v]
-				# src.readline()
-		return offsets
-
-	def state_get(self, k, t='last-msg'): return self.state.get(f'{t}.{k}')
-
-	def state_set(self, k, ts, t='last-msg', sync=False):
-		if not self.state_tracked: return
-		if not self._state_section: self.update_file_section('state', 'tracked')
-		k, v = f'{t}.{k}', ts_iso8601(ts)
-		if k not in self.state:
-			self.update_file_section('state', {k: v})
-			self.state[k] = ts
-			return self.state_cleanup()
-		if self.state[k] > ts: return
-		src, offsets = self._state_source_get()
-		n, v = offsets[k], v.encode()
-		src.seek(n)
-		parse_iso8601(src.read(len(v)).decode(), validate=True)
-		src.seek(n)
-		src.write(v)
-		src.flush()
-		if sync: os.fdatasync(src.fileno())
-		self.state[k], self._state_file_ts = ts, os.fstat(src.fileno()).st_ctime
-
-	def state_cleanup(self, keep_max=10):
-		keys = sorted((v,k) for k,v in self.state.items())
-		if len(keys) <= keep_max: return
-		src, offsets = self._state_source_get()
-		offsets = sorted( ((offsets[k], k) for v,k in
-			keys[:len(keys) - keep_max]), reverse=True )
-		with src, safe_replacement(src.name, 'wb') as dst:
-			src.seek(0)
-			for line in iter(src.readline, b''):
-				if offsets and offsets[-1][0] < src.tell():
-					n, k = offsets.pop()
-					del self.state[k]
-					continue
-				dst.write(line)
-		self._state_source_flush()
 
 
 class KelpBladeInterface:
@@ -1485,62 +1421,46 @@ def main(args=None, conf=None):
 	if not conf: conf = KelpConfig()
 
 	import argparse, textwrap
-	dedent = lambda text: (textwrap.dedent(text).strip('\n') + '\n').replace('\t', '  ')
-	text_fill = lambda s,w=100,ind='\t',ind_next=None,**k: textwrap.fill(
-		s, w, initial_indent=ind, subsequent_indent=ind if ind_next is None else ind_next, **k )
-	class SmartHelpFormatter(argparse.HelpFormatter):
-		def __init__(self, *args, **kws):
-			return super().__init__(*args, **kws, width=100)
-		def _fill_text(self, text, width, indent):
-			if '\n' not in text: return super()._fill_text(text, width, indent)
-			return ''.join( indent + line
-				for line in text.replace('\t', '  ').splitlines(keepends=True) )
-		def _split_lines(self, text, width):
-			return super()._split_lines(text, width)\
-				if '\n' not in text else dedent(text).splitlines()
-
+	dd = lambda text: (textwrap.dedent(text).strip('\n') + '\n').replace('\t', '  ')
+	fill = lambda s,w=80,**k: textwrap.fill(s, w, **k)
 	parser = argparse.ArgumentParser(
-		formatter_class=SmartHelpFormatter,
-		description='Kelp irc daemon for hosting various asyncio services.')
+		formatter_class=argparse.RawTextHelpFormatter,
+		usage='%(prog)s [options]',
+		description='Kelp IRC daemon for hosting various asyncio services.')
 
 	group = parser.add_argument_group('Configuration file(s)')
-	group.add_argument('-c', '--conf',
-		metavar='file', action='append',
-		help=f'''
-			Path to configuration file to use.
-			It will get updated with state info ([state] section), so has to be writable.
-			Default: {conf._conf_path}''')
+	group.add_argument('-c', '--conf', metavar='file', action='append', help=dd(f'''
+		Path to configuration file to use.
+		It will get updated with state info ([state] section), so has to be writable.
+		Default: {conf._conf_path}'''))
 	group.add_argument('--conf-dump', action='store_true',
-		help='Print all configuration settings, which will be used with'
-			' currently detected (and/or specified) configuration file(s), and exit.')
+		help=fill('Print all configuration settings, which will be used with'
+			' currently detected (and/or specified) configuration file(s), and exit.'))
 	group.add_argument('--conf-dump-defaults', action='store_true',
-		help='Print all default settings, which would be used'
-			' if no configuration file(s) were overriding these, and exit.')
+		help=fill('Print all default settings, which would be used'
+			' if no configuration file(s) were overriding these, and exit.'))
 	group.add_argument('--conf-dump-state', action='store_true',
 		help='Print "state" section from the config file.')
 
 	group = parser.add_argument_group('Interfaces')
-	group.add_argument('-i', '--irc-bind', metavar='host(:port)',
-		help=f'''
-			Address/host (to be resolved via gai) and port to bind IRC server to.
-			When specifying port after raw IPv6 address,
-				enclose the latter in [], for example - [::]:6667.
-			Default: {conf.irc_host}:{conf.irc_port} or whatever is in --conf file.''')
+	group.add_argument('-i', '--irc-bind', metavar='host(:port)', help=dd(f'''
+		Address/host (to be resolved via gai) and port to bind IRC server to.
+		When specifying port after raw IPv6 address,
+			enclose the latter in [], for example - [::]:6667.
+		Default: {conf.irc_host}:{conf.irc_port} or whatever is in --conf file.'''))
 
 	group = parser.add_argument_group('Logging and debug opts')
 	group.add_argument('-d', '--debug',
 		action='store_true', help='Verbose operation mode.')
 	group.add_argument('-t', '--proto-cut', type=int, metavar='n',
-		help='Truncate long strings in protocol dumps to specified length.'
-			' Set to <=0 to disable truncation (default).')
-	group.add_argument('-p', '--proto-log', metavar='file',
-		help='''
-			File to dump full non-truncated protocol logs to.
-			Max file size and rotation options can be configured via --conf file.''')
-	group.add_argument('-l', '--debug-log', metavar='file',
-		help='''
-			Separate file for debug-level logging, regardless of levels set elsewhere.
-			Max file size and rotation options can be configured via --conf file.''')
+		help=fill('Truncate long strings in protocol dumps to specified length.'
+			' Set to <=0 to disable truncation (default).'))
+	group.add_argument('-p', '--proto-log', metavar='file', help=dd('''
+		File to dump full non-truncated protocol logs to.
+		Max file size and rotation options can be configured via --conf file.'''))
+	group.add_argument('-l', '--debug-log', metavar='file', help=dd('''
+		Separate file for debug-level logging, regardless of levels set elsewhere.
+		Max file size and rotation options can be configured via --conf file.'''))
 
 	opts = parser.parse_args(sys.argv[1:] if args is None else args)
 
@@ -1617,7 +1537,7 @@ def main(args=None, conf=None):
 		gai_bind('tcp', opts.irc_bind or conf.irc_host, conf.irc_port, conf.irc_host_af, log)
 
 	log.debug('Starting eventloop...')
-	with contextlib.closing(asyncio.get_event_loop()) as loop:
+	with cl.closing(asyncio.get_event_loop()) as loop:
 		# if conf.debug_verbose: loop.set_debug(True)
 		kelp = Kelp(loop, conf)
 
@@ -1633,9 +1553,9 @@ def main(args=None, conf=None):
 		if blades: kelp.load_blades(blades)
 
 		kelp_task = loop.create_task(kelp.run_async())
-		for sig in 'INT TERM'.split():
-			loop.add_signal_handler(getattr(signal, f'SIG{sig}'), kelp_task.cancel)
-		with contextlib.suppress(asyncio.CancelledError):
+		for sig in signal.SIGINT, signal.SIGTERM:
+			loop.add_signal_handler(sig, kelp_task.cancel)
+		with cl.suppress(asyncio.CancelledError):
 			return loop.run_until_complete(kelp_task)
 	log.debug('Finished')
 

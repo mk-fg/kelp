@@ -253,7 +253,6 @@ more easily readable::
   [aliases]
   blade.csug = logs
 
-(to turn e.g. #csug.system into #logs.system, and same for other channels of
-that plugin)
+(to turn e.g. #csug.system into #logs.system, and same for other channels of that plugin)
 
 Currently only implemented for Blade UIDs in IRC channel names.
