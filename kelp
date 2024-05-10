@@ -11,7 +11,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.18' # git-version: py-str
+	version = '1.19' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -889,7 +889,7 @@ class Kelp:
 
 	async def __aenter__(self):
 		self.server_ver = self.conf.version
-		self.server_ts = dt.datetime.utcnow()
+		self.server_ts = dt.datetime.now(dt.UTC)
 		self.server_host = os.uname().nodename
 		self.irc_conns, self.irc_conns_max = adict(), 0
 		self.irc_auth_tbf = token_bucket(self.conf.irc_auth_tbf)
