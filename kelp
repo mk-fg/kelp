@@ -11,7 +11,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.20' # git-version: py-str
+	version = '1.21' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -424,11 +424,11 @@ class IRCProtocol:
 				log = get_logger('kelp.irc.factory')
 				log.exception('Failed to initialize ircd protocol: {}', err_fmt(err))
 				log.critical('Stopping daemon due to unhandled protocol error')
-				bridge.loop.stop()
+				asyncio.get_running_loop().stop()
 		return _wrapper
 
 	def __init__(self, bridge):
-		self.bridge, self.loop, self.conf = bridge, bridge.loop, bridge.conf
+		self.bridge, self.conf = bridge, bridge.conf
 		self.log = get_logger('kelp.irc.init')
 		self.transport, self.buff, self.recv_queue = None, b'', asyncio.Queue()
 		self._cmd_cache, self.st = dict(), adict(
@@ -598,14 +598,18 @@ class IRCProtocol:
 				self.log.exception('Error processing message: {}', m)
 
 	def check_access(self, cmd):
-		if self.st.cap_neg: return cmd in ['cap', 'quit']
 		if not self.st.auth:
 			res = cmd in ['cap', 'user', 'nick', 'pass', 'quit', 'ping']
 			if not res: self.send(451, ':You have not registered')
 			return res
-		res = cmd not in ['user', 'pass']
-		if not res: self.send(462, ':You may not reregister')
-		return res
+		elif cmd in ['user', 'pass']:
+			self.send(462, ':You may not reregister')
+			return False
+		if self.st.cap_neg:
+			# No commands other than auth allowed until capability negotiation ends
+			# Note that negotiation can be skipped entirely too
+			return cmd in ['cap', 'quit', 'ping']
+		return True # any commands allowed outside of phases above
 
 	# chan_spec=#some-channel, chan_name=lower(some-channel)
 	_csc = lambda c: c.startswith('#')
@@ -883,8 +887,8 @@ class Kelp:
 		chan_monitor = f'{chan_prefix}monitor'
 		chan_sys_list = [chan_control, chan_debug]
 
-	def __init__(self, loop, conf):
-		self.loop, self.conf, self.init, self.blades = loop, conf, None, dict()
+	def __init__(self, conf):
+		self.conf, self.init, self.blades = conf, None, dict()
 		self.log = get_logger('kelp.bridge')
 
 	async def __aenter__(self):
@@ -953,7 +957,7 @@ class Kelp:
 		return blades
 
 	async def run(self):
-		ircd = await self.loop.create_server(
+		ircd = await asyncio.get_running_loop().create_server(
 			IRCProtocol.factory_for_bridge(self),
 			self.conf.irc_host, self.conf.irc_port,
 			family=self.conf.irc_host_af, start_serving=False )
@@ -1338,7 +1342,7 @@ class KelpBladeInterface:
 	act_t = enum.Enum('act_t', 'names msg topic')
 
 	def __init__(self, name, kelp, blade_init):
-		self.bridge, self.loop, self.conf = kelp, kelp.loop, kelp.conf
+		self.bridge, self.conf = kelp, kelp.conf
 		self.name, self.blade, self.enabled = name, blade_init(self), False
 		self._log = get_logger('kelp.echo')
 		self._chan_names = self._chan_map_func = self._chan_act_func = None
@@ -1536,10 +1540,8 @@ def main(args=None, conf=None):
 	sock_t, sock_p, conf.irc_host_af, conf.irc_host, conf.irc_port = \
 		gai_bind('tcp', opts.irc_bind or conf.irc_host, conf.irc_port, conf.irc_host_af, log)
 
-	log.debug('Starting eventloop...')
-	with cl.closing(asyncio.get_event_loop()) as loop:
-		# if conf.debug_verbose: loop.set_debug(True)
-		kelp = Kelp(loop, conf)
+	async def _run_kelp():
+		loop, kelp = asyncio.get_event_loop(), Kelp(conf)
 
 		log_handler = conf._debug_chan = LogFuncHandler(kelp.cmd_log)
 		log_handler.setLevel(logging.DEBUG if conf.debug_verbose else logging.WARNING)
@@ -1552,11 +1554,13 @@ def main(args=None, conf=None):
 		blades = conf.blades_enabled.split()
 		if blades: kelp.load_blades(blades)
 
-		kelp_task = loop.create_task(kelp.run_async())
+		kelp_task = asyncio.create_task(kelp.run_async())
 		for sig in signal.SIGINT, signal.SIGTERM:
 			loop.add_signal_handler(sig, kelp_task.cancel)
-		with cl.suppress(asyncio.CancelledError):
-			return loop.run_until_complete(kelp_task)
+		with cl.suppress(asyncio.CancelledError): return await kelp_task
+
+	log.debug('Starting eventloop...')
+	return asyncio.run(_run_kelp())
 	log.debug('Finished')
 
 if __name__ == '__main__': sys.exit(main())

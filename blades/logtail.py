@@ -138,8 +138,7 @@ class LogTailer:
 		self.iface, self.log = iface, iface.get_logger('logtail')
 
 	async def __aenter__(self):
-		self.loop, self.conf = ( self.iface.loop,
-			self.iface.read_conf_section('logtail', LogtailConf) )
+		self.conf = self.iface.read_conf_section('logtail', LogtailConf)
 		self.inotify = INotify().open()
 
 		self.file_state_dir = pl.Path(self.conf.state_dir)

@@ -1,6 +1,79 @@
 import os, sys, asyncio, socket, struct, binascii, hashlib, time
 
-import libnacl
+
+class NaCl:
+
+	nonce_size = key_size = key_encode = key_decode = random = error = None
+
+	def __init__(self):
+		libnacl = nacl = None
+		try: import libnacl
+		except ImportError:
+			try: import nacl
+			except ImportError:
+				raise ImportError( 'Either libnacl or pynacl module'
+					' is required for this tool, neither one can be imported.' )
+
+		if libnacl:
+			import base64
+			from libnacl.secret import SecretBox
+			self.nonce_size = libnacl.crypto_secretbox_NONCEBYTES
+			self.key_size = libnacl.crypto_secretbox_KEYBYTES
+			self.key_encode = lambda key: base64.urlsafe_b64encode(key.sk).decode()
+			self.key_decode = lambda key_str, raw=False:\
+				SecretBox(key_str if raw else base64.urlsafe_b64decode(key_str))
+			self.cb_keygen_seed = libnacl.crypto_box_seed_keypair
+			self.cb = ( lambda msg, nonce, pk, sk:
+				nonce + libnacl.crypto_box(msg, nonce, pk, sk) )
+			self.cb_open = ( lambda buff, pk, sk:
+				libnacl.crypto_box_open(buff[self.nonce_size:], buff[:self.nonce_size], pk, sk) )
+			self.random = libnacl.randombytes
+			self.error = libnacl.CryptError
+
+		if nacl:
+			import warnings
+			with warnings.catch_warnings(record=True): # cffi warnings
+				from nacl.exceptions import CryptoError
+				from nacl.encoding import RawEncoder, URLSafeBase64Encoder
+				from nacl.public import PrivateKey, PublicKey, Box
+				from nacl.secret import SecretBox
+				from nacl.utils import random
+			self.nonce_size = SecretBox.NONCE_SIZE
+			self.key_size = SecretBox.KEY_SIZE
+			self.key_encode = lambda key: key.encode(URLSafeBase64Encoder).decode().strip()
+			self.key_decode = lambda key_str, raw=False:\
+				SecretBox(key_str, URLSafeBase64Encoder if not raw else RawEncoder)
+			def _cb_keygen_seed(seed):
+				sk = PrivateKey.from_seed(seed)
+				return bytes(sk.public_key), bytes(sk)
+			self.cb_keygen_seed = _cb_keygen_seed
+			self.cb = lambda msg, nonce, pk, sk: Box(PrivateKey(sk), PublicKey(pk)).encrypt(msg, nonce)
+			self.cb_open = lambda buff, pk, sk: Box(PrivateKey(sk), PublicKey(pk)).decrypt(buff)
+			self.random = random
+			self.error = CryptoError
+
+	def test( self, msg=b'test',
+			key_enc='pbb6wrDXlLWOFMXYH4a9YHh7nGGD1VnStVYQBe9MyVU=' ):
+		# Should run without exceptions and return same consistent hash for both libs
+		import hashlib
+		key = self.key_decode(self.random(self.key_size), raw=True)
+		assert key.decrypt(key.encrypt(msg, self.random(self.nonce_size)))
+		key = self.key_decode(key_enc)
+		assert self.key_encode(key) == key_enc
+		msg_enc = key.encrypt(msg, key_enc[:self.nonce_size].encode())
+		msg_dec = key.decrypt(msg_enc)
+		assert msg_dec == msg
+		(pk1, sk1), (pk2, sk2) = (self.cb_keygen_seed(k) for k in [b'a'*32, b'b'*32])
+		nonce = hashlib.sha256(msg).digest()[:self.nonce_size]
+		msg_box = self.cb(msg, nonce, pk2, sk1)
+		msg_unbox = self.cb_open(msg_box, pk1, sk2)
+		assert msg == msg_unbox
+		print(hashlib.sha256(b''.join([
+			str(self.key_size).encode(), str(self.nonce_size).encode(),
+			self.key_encode(key).encode(), msg, msg_enc, msg_dec,
+			pk1, sk1, pk2, sk2, nonce, msg_box, msg_unbox ])).hexdigest())
+
+nacl = NaCl()
 
 
 class UDPRSConf:
@@ -42,8 +115,7 @@ class UDPReportSink:
 		self.log_proto = iface.get_logger('udprs', proto=True)
 
 	async def __aenter__(self):
-		self.loop, self.conf = ( self.iface.loop,
-			self.iface.read_conf_section('udp-report-sink', UDPRSConf) )
+		self.conf = self.iface.read_conf_section('udp-report-sink', UDPRSConf)
 		chan_info = self.iface.read_conf_section('udp-report-sink-chans').items()
 		key_aliases = dict(self.iface.read_conf_section('udp-report-sink-keys').items())
 
@@ -87,17 +159,17 @@ class UDPReportSink:
 
 		if not self.conf.cb_key:
 			raise ValueError('Local CryptoBox Seed value must be specified in config file')
-		self.pk, self.sk = libnacl.crypto_box_seed_keypair(self.b64dec(self.conf.cb_key))
+		self.pk, self.sk = nacl.cb_keygen_seed(self.b64dec(self.conf.cb_key))
 		self.log.debug('Local crypto_box pubkey: {}', self.b64enc(self.pk)) # for sender
 		for k, pk_list in chan_key_list.items():
 			self.log.debug('Channel pubkeys [{}]: {}', k, ' '.join(pk_list))
 
-		self.frags, self.hbs = dict(), dict()
+		self.frags, self.hbs, loop = dict(), dict(), asyncio.get_running_loop()
 		sock_t, sock_p, self.conf.host_af, self.conf.host, self.conf.port = \
 			self.iface.lib.gai_bind('udp', self.conf.host, self.conf.port, self.conf.host_af, self.log)
-		self.transport, proto = await self.loop.create_datagram_endpoint( lambda: self,
+		self.transport, proto = await loop.create_datagram_endpoint( lambda: self,
 			local_addr=(self.conf.host, self.conf.port), family=self.conf.host_af, proto=sock_p )
-		self.hbs_task = self.loop.create_task(self.hbs_check(
+		self.hbs_task = loop.create_task(self.hbs_check(
 			self.conf.hb_check_interval, self.conf.hb_check_grace_factor ))
 
 	async def __aexit__(self, *err):
@@ -109,7 +181,7 @@ class UDPReportSink:
 		while True:
 			try:
 				for pk, hb in self.hbs.items():
-					if self.loop.time() - hb.ts_mono < hb.interval * grace_factor: continue
+					if time.monotonic() - hb.ts_mono < hb.interval * grace_factor: continue
 					chan, pk_b64 = self.chan_keys[pk]
 					self.iface.send_msg( chan, self.chan_names[chan],
 						f'-------- HB-MISSING: pk={pk_b64}'
@@ -181,8 +253,8 @@ class UDPReportSink:
 	def parse(self, addr_str, uid_str, uid_mark, buff):
 		nonce, buff = buff[:24], buff[24:]
 		for pk, (chan, pk_b64) in self.chan_keys.items():
-			try: pkt = libnacl.crypto_box_open(buff, nonce, pk, self.sk)
-			except libnacl.CryptError: continue
+			try: pkt = nacl.cb_open(buff, pk, self.sk)
+			except nacl.error: continue
 			break
 		else:
 			self.log.error( 'No key to decode msg:'
@@ -212,7 +284,7 @@ class UDPReportSink:
 					chan, self.chan_names[chan], '-------- HB-ERR-COUNT:'
 						f' pk={pk_b64} err-inc={err_diff} ts-last=[{ts_fmt(hb.ts)}] --------', notice=True )
 			self.hbs[pk] = self.iface.lib.adict( ts=time.time(),
-				ts_mono=self.loop.time(), interval=hb_interval, err_count=err_count )
+				ts_mono=time.monotonic(), interval=hb_interval, err_count=err_count )
 
 		else:
 			lines = pkt.decode('utf-8', 'replace')
@@ -221,8 +293,8 @@ class UDPReportSink:
 		return pk, uid
 
 	def send_ack(self, addr_str, uid_str, pk, uid, addr):
-		nonce = os.urandom(24)
-		buff = nonce + libnacl.crypto_box(uid, nonce, pk, self.sk)
+		nonce = os.urandom(nacl.nonce_size)
+		buff = nacl.cb(uid, nonce, pk, self.sk)
 		mark, msg = ' >>', f'{addr_str} :: {uid_str} :: ack'
 		self.log_proto.debug(f'{mark} {msg}', extra=(mark, msg))
 		self.transport.sendto(buff, addr)
