@@ -11,7 +11,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.21' # git-version: py-str
+	version = '1.22' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -342,7 +342,7 @@ async def aio_loop(*tasks, gc_only=False):
 		if not task.done(): task.cancel()
 		try: await task
 		except asyncio.CancelledError: continue
-		except: task_res = task
+		except Exception as err: task_res = err
 		if not task_res: task_res = task
 	if task_res:
 		if not hasattr(task_res, 'cancel'): raise task_res from task_res
@@ -369,9 +369,7 @@ class StacklessContext:
 		async def _task_wrapper(coro=coro):
 			try:
 				await aio_await_wrap(coro)
-				if run_after:
-					coro = run_after()
-					await aio_await_wrap(coro)
+				if run_after: await aio_await_wrap(coro := run_after())
 			except asyncio.CancelledError: pass
 			except Exception as err:
 				self.log.exception('Background task failed: {} - {}', coro, err_fmt(err))
@@ -958,17 +956,20 @@ class Kelp:
 
 	async def run(self):
 		ircd = await asyncio.get_running_loop().create_server(
-			IRCProtocol.factory_for_bridge(self),
-			self.conf.irc_host, self.conf.irc_port,
-			family=self.conf.irc_host_af, start_serving=False )
-		### Other asyncio things should be initialized and started here
-		tasks = [self.tasks.add(ircd.serve_forever())]
+			IRCProtocol.factory_for_bridge(self), self.conf.irc_host, self.conf.irc_port,
+			family=self.conf.irc_host_af, start_serving=False, reuse_port=True )
 		async with cl.AsyncExitStack() as ctx:
+			await ctx.enter_async_context(ircd)
+			await ircd.start_serving()
+			tasks = list()
 			for blade in self.blades.values():
 				await ctx.enter_async_context(blade)
 				if blade._run_task: tasks.append(blade._run_task)
+			if not tasks: tasks.append(asyncio.sleep(2**32)) # can be just contexts
 			self.log.debug('Starting ircd...')
-			await aio_loop(*tasks)
+			try: await aio_loop(*tasks)
+			except asyncio.CancelledError:
+				for conn in self.irc_conns.values(): conn.transport.close() # for ircd ctx
 			self.log.debug('Finished')
 
 	async def run_async(self):
