@@ -1,16 +1,14 @@
 #!/usr/bin/env python
 
-import os, sys, socket, struct, base64, time
+import os, sys, socket, struct, base64, time, runpy
 
-import libnacl
-
-
+nacl = runpy.run_path(__file__ + f'/../udp-report-sink.py')['nacl']
 b64_encode = lambda s: base64.urlsafe_b64encode(s).decode()
 b64_decode = lambda s: ( base64.urlsafe_b64decode
 	if '-' in s or '_' in s else base64.standard_b64decode )(s)
 
 # seed = os.urandom(32)
-# pk, sk = libnacl.crypto_box_seed_keypair(seed)
+# pk, sk = nacl.cb_keygen_seed(seed)
 # print('key:', b64_encode(seed))
 # print('pk:', b64_encode(pk))
 # print('sk:', b64_encode(sk))
@@ -23,9 +21,10 @@ b64_decode = lambda s: ( base64.urlsafe_b64decode
 def main():
 	dst_addr = '127.0.0.1', 1234
 	dst_pk = b64_decode('Msf_VdIGWquWN2SwCs9A4hDaE9rBUSkoxWiiOiLCQkY=')
-	src_pk, src_sk = libnacl.crypto_box_seed_keypair(
+	src_pk, src_sk = nacl.cb_keygen_seed(
 		b64_decode('q7S6eb9dHlLdOi3h-8kgFrzFllxEcR8vqDd50Yj1HcA=') )
 	print('src-pk:', b64_encode(src_pk))
+	print('dst-pk:', b64_encode(dst_pk))
 	mtu = 500
 
 	uid_len = 8
@@ -59,8 +58,7 @@ def main():
 
 		def data_send(uid, buff):
 			n, nonce, uid_mark = 0, os.urandom(24), uid_mask_apply(uid)
-			buff = nonce + libnacl.crypto_box(
-				box_header.pack(uid, int(time.time())) + buff, nonce, dst_pk, src_sk )
+			buff = nacl.cb(box_header.pack(uid, int(time.time())) + buff, nonce, dst_pk, src_sk)
 			while buff:
 				frame, buff = buff[:data_len], buff[data_len:]
 				frame_n, n = n, n + 1
@@ -72,8 +70,7 @@ def main():
 
 		def data_ack_recv():
 			buff, addr = s.recvfrom(65535)
-			nonce, buff = buff[:24], buff[24:]
-			return libnacl.crypto_box_open(buff, nonce, dst_pk, src_sk)
+			return nacl.cb_open(buff, dst_pk, src_sk)
 
 		### Send/ack report lines
 
