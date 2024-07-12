@@ -119,7 +119,6 @@ class INotify:
 			if self.fd:
 				self._call('inotify_rm_watch', self.fd, wd)
 				self.wd_info.pop(wd)
-			os.close(wd)
 		async def ev_iter(dummy_first=True, dummy_interval=None):
 			if dummy_first: yield # for easy setup-on-first-iter in "async for"
 			while True:
