@@ -251,19 +251,15 @@ class UDPReportSink:
 			self.send_ack(addr_str, uid_str, pk, uid, addr)
 
 	def parse(self, addr_str, uid_str, uid_mark, buff):
-		nonce, buff = buff[:24], buff[24:]
 		for pk, (chan, pk_b64) in self.chan_keys.items():
 			try: pkt = nacl.cb_open(buff, pk, self.sk)
 			except nacl.error: continue
 			break
-		else:
-			self.log.error( 'No key to decode msg:'
-				' addr={} uid={} len={}', addr_str, uid_str, len(buff) )
-			return
+		else: return self.log.error( 'No key to decode'
+				' msg: addr={} uid={} len={}', addr_str, uid_str, len(buff) )
 
-		n = self.box_header.size
 		try:
-			if len(pkt) < n: raise UDPRSError('too short')
+			if len(pkt) < (n := self.box_header.size): raise UDPRSError('too short')
 			header, pkt = pkt[:n], pkt[n:]
 			uid, ts = self.box_header.unpack(header)
 			if self.uid_mask(uid) != uid_mark: raise UDPRSError('uid mark mismatch')
