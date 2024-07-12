@@ -11,7 +11,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.22' # git-version: py-str
+	version = '1.23' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -965,10 +965,11 @@ class Kelp:
 			for blade in self.blades.values():
 				await ctx.enter_async_context(blade)
 				if blade._run_task: tasks.append(blade._run_task)
-			if not tasks: tasks.append(asyncio.sleep(2**32)) # can be just contexts
+			if not tasks: tasks.append(asyncio.Future()) # can be just contexts
 			self.log.debug('Starting ircd...')
 			try: await aio_loop(*tasks)
 			except asyncio.CancelledError:
+				ircd.close()
 				for conn in self.irc_conns.values(): conn.transport.close() # for ircd ctx
 			self.log.debug('Finished')
 
