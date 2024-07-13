@@ -11,7 +11,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.23' # git-version: py-str
+	version = '1.24' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -956,11 +956,10 @@ class Kelp:
 
 	async def run(self):
 		ircd = await asyncio.get_running_loop().create_server(
-			IRCProtocol.factory_for_bridge(self), self.conf.irc_host, self.conf.irc_port,
-			family=self.conf.irc_host_af, start_serving=False, reuse_port=True )
+			IRCProtocol.factory_for_bridge(self), self.conf.irc_host,
+			self.conf.irc_port, family=self.conf.irc_host_af, reuse_port=True )
 		async with cl.AsyncExitStack() as ctx:
 			await ctx.enter_async_context(ircd)
-			await ircd.start_serving()
 			tasks = list()
 			for blade in self.blades.values():
 				await ctx.enter_async_context(blade)
