@@ -94,12 +94,15 @@ See scripts in "blades" dir and KelpBladeInterface object for any implementation
 <a name=hdr-udp-report-sink></a>
 ### udp-report-sink
 
-Plugin for receiving occasional usually-multiline log errors/warnings
-from remote sources to feed them into irc channel(s) as notifications,
-picking destination channel based on libnacl crypto_box key used for encryption.
+Plugin for remote logging/reporting.
 
-In addition logs missing heartbeats from remote, local/remote error counter
-jumps (e.g. due to failed delivery), does auth-encryption via pynacl, etc.
+Intended to receive occasional maybe-multiline log error/warning reports from
+remote sources to feed them into irc channel(s) as notifications, picking
+destination channel based on nacl crypto_box pubkey used for decryption.
+
+In addition can create/track heartbeat timers, and warn about local/remote error
+counter mismatches (e.g. due to failed delivery), for persistent remote endpoints.
+Does auth-encryption via [libnacl]/[pynacl] [libsodium] wrappers.
 
 Config sections:
 
@@ -134,19 +137,19 @@ cb_key = _p0ZbIHfK86H263_DBvaAbyrglrmqhcY0dOBppyPmgU=
 
 [udp-report-sink-chans]
 
-test = @test-key @reporter-A
+test = @test-key @logger-A
 test.topic = Reports from A and misc testing
 test.nick = crashey
 
-main = @reporter-A @reporter-B @reporter-C
+main = @logger-A @logger-B @logger-C
 main.topic = Reports from A, B and C
 main.nick = reporterbot
 
 [udp-report-sink-keys]
 test-key = Msf_VdIGWquWN2SwCs9A4hDaE9rBUSkoxWiiOiLCQkY=
-reporter-A = YJkoWjFc7yOyXP23PLVLDy0Izl0B4Hu/Z8eb6PyahUk=
-reporter-B = 0Fhfk1ujYvrEUkJ8VaO9YySc02Q/wE2c9vi597bIBHI=
-reporter-C = +JqMz5Pzj2yjAD/XYDoaOHmnvgPe2PwjkLeJoDTnqWM=
+logger-A = YJkoWjFc7yOyXP23PLVLDy0Izl0B4Hu/Z8eb6PyahUk=
+logger-B = 0Fhfk1ujYvrEUkJ8VaO9YySc02Q/wE2c9vi597bIBHI=
+logger-C = +JqMz5Pzj2yjAD/XYDoaOHmnvgPe2PwjkLeJoDTnqWM=
 ```
 
 All crypto keys can be generated via `wg genkey` (wireguard also uses
@@ -154,6 +157,9 @@ curve-25519 keys) or base64-encoding 32 bytes from `/dev/urandom`.
 
 See [udp-report-send-test.py] for an example of a simple sender script.
 
+[pynacl]: https://pynacl.readthedocs.io/
+[libnacl]: https://libnacl.readthedocs.io/
+[libsodium]: https://doc.libsodium.org/
 [udp-report-sink.py]: blades/udp-report-sink.py
 [udp-report-send-test.py]: blades/udp-report-send-test.py
 
@@ -252,9 +258,6 @@ and this tailer allows to use those for irc notifications.
 
 * [Python 3.8+](https://python.org/)
 * [udp-report-sink] - [libnacl] or [pynacl] (whichever can be imported)
-
-[pynacl]: https://pynacl.readthedocs.io/
-[libnacl]: https://libnacl.readthedocs.io/
 
 
 <a name=hdr-misc_features></a>

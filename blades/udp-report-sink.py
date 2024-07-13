@@ -1,6 +1,41 @@
 import os, sys, asyncio, socket, struct, binascii, hashlib, time
 
 
+class UDPRSConf:
+
+	# Bind host, port, address-family (for hostname, 0=any).
+	host = '127.0.0.1:1234'
+	port = ''
+	host_af = 0
+
+	recv_timeout = 8 * 60.0 # for multi-packet msgs, log errs if all fail to arrive in time
+	recv_ts_skew = 5 * 60.0 # discards msgs with too-old timestamps in them - can be replays
+
+	# If received packet starts with hb_magic, heartbeat-interval check gets created.
+	# hb-packets should unpack to "hb_interval || err_count" values,
+	#  which determine when to expect next/follow-up packet(s) (should be constant),
+	#  and report any err_count mismatch wrt received report count from that pubkey.
+	# hb_check_interval / hb_check_grace_factor is interval between checks for all used
+	#  hb-timers, and reporting warnings about any missed ones (with grace_factor slack).
+	hb_magic = b'\0hb\0'
+	hb_data = struct.Struct('>IQ')
+	hb_check_interval = 30 * 60
+	hb_check_grace_factor = 4.3
+
+	cb_key = '' # server's private 25519 key, must be specified
+	topic = 'udp-report-sink [{conf.host}:{conf.port}]' # channel topic
+	nick = 'ursa' # bot nick used to relay msgs from
+
+	# Single report is reassembed from frames with same uid.
+	# Can have some bits masked to specific values to filter-out junk packets from logs.
+	# Such filtering is not for security, to avoid warn-logging random internet noise.
+	uid_len = 8 # bytes for random uid
+	uid_mask_intervals = '3,9,7,6' # csv of intervals to check bits at, last one repeated
+	uid_mask_bits = '--x--xx-x-' # bits at intervals to match, dash=0 x=1
+
+	# See also: udp-report-sink-chans mapping of chans to keys/topics.
+
+
 class NaCl:
 
 	nonce_size = key_size = key_encode = key_decode = random = error = None
@@ -74,35 +109,6 @@ class NaCl:
 			pk1, sk1, pk2, sk2, nonce, msg_box, msg_unbox ])).hexdigest())
 
 nacl = NaCl()
-
-
-class UDPRSConf:
-
-	host = '127.0.0.1:1234'
-	port = ''
-	host_af = 0
-	recv_timeout = 8 * 60.0
-	recv_ts_skew = 5 * 60.0
-
-	hb_check_interval = 30 * 60
-	hb_check_grace_factor = 4.3
-	hb_magic = b'\0hb\0'
-	hb_data = struct.Struct('>IQ')
-
-	cb_key = '' # must be specified
-	topic = 'udp-report-sink [{conf.host}:{conf.port}]'
-	nick = 'ursa'
-
-	### Single report is reassembed from frames with same uid
-	### Can have some bits masked to specific values to filter-out junk packets from logs
-	### Such filtering is not for security, just to avoid logging random internet noise
-	uid_len = 8 # bytes for random uid
-	uid_mask_intervals = '3,9,7,6' # csv intervals to check bits at, last one repeated
-	uid_mask_bits = '--x--xx-x-' # bits at intervals to match, dash=0 x=1
-
-	# See also: udp-report-sink-chans mapping of chans to keys/topics.
-
-
 ts_fmt = lambda ts: time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
 
 
@@ -219,8 +225,7 @@ class UDPReportSink:
 			else:
 				n = sum(1 for n in range(entry.c + 1) if n in entry)
 				if n < entry.c: timeout_err = f'missing frames (recv={n}/{entry.c})'
-			self.log.error( 'Entry timed-out [{}]: {}',
-				self.b64enc(uid_chk), timeout_err )
+			self.log.error('Entry timed-out [{}]: {}', self.b64enc(uid_chk), timeout_err)
 
 		# Fragment processing
 		if seq & 0x8000: final, seq = True, seq - 0x8000
