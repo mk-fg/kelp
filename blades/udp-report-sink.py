@@ -261,7 +261,7 @@ class UDPReportSink:
 			except nacl.error: continue
 			break
 		else: return self.log.error( 'No key to decode'
-				' msg: addr={} uid={} len={}', addr_str, uid_str, len(buff) )
+			' msg: addr={} uid={} len={}', addr_str, uid_str, len(buff) )
 
 		try:
 			if len(pkt) < (n := self.box_header.size): raise UDPRSError('too short')
@@ -271,13 +271,12 @@ class UDPReportSink:
 			if abs(time.time() - ts) >= self.conf.recv_ts_skew:
 				raise UDPRSError(f'timestamp mismatch: {ts}')
 		except UDPRSError as err:
-			self.log.error( 'Bogus payload (addr={},'
+			return self.log.error( 'Bogus payload (addr={},'
 				' uid={}, pk={}): {}', addr_str, uid_str, pk_b64, err )
-			return
 
 		if pkt.startswith(self.conf.hb_magic):
 			n, fmt = len(self.conf.hb_magic), self.conf.hb_data
-			hb_interval, err_count = fmt.unpack(pkt[n:n + fmt.size])
+			(hb_interval, err_count), pkt = fmt.unpack(pkt[n:n+fmt.size]), pkt[n+fmt.size:]
 			hb = self.hbs.get(pk)
 			if hb and err_count > hb.err_count:
 				err_diff = err_count - hb.err_count
@@ -287,7 +286,7 @@ class UDPReportSink:
 			self.hbs[pk] = self.iface.lib.adict( ts=time.time(),
 				ts_mono=time.monotonic(), interval=hb_interval, err_count=err_count )
 
-		else:
+		if pkt:
 			lines = pkt.decode('utf-8', 'replace')
 			self.iface.send_msg(chan, self.chan_names[chan], lines)
 
