@@ -11,7 +11,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.24' # git-version: py-str
+	version = '1.25' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -1416,7 +1416,7 @@ class KelpBladeInterface:
 		chan = self._chan_name(chan)
 		if self.conf.debug_msg_echo:
 			for ls in line.split('\n'):
-				self._log.debug('{} <{}> {}{}', chan, nick, notice and '[notice]' or '', ls.rstrip())
+				self._log.debug('{} <{}> {}{}', chan, nick, notice and '[notice] ' or '', ls.rstrip())
 		self.bridge.cmd_msg_blade(chan, nick, line, notice=notice)
 
 

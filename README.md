@@ -22,8 +22,7 @@ Table of Contents
 ![kelp forest stacks][]
 
 [udp-report-sink]: #hdr-udp-report-sink
-[kelp forest stacks]:
-  https://i.cbc.ca/1.5948104.1615583183!/fileImage/httpImage/image.jpg_gen/derivatives/original_1180/stunning-kelp-forests.jpg
+[kelp forest stacks]: kelp.jpg
 
 
 <a name=hdr-description></a>
@@ -38,6 +37,12 @@ but feel free to use anything here that might be of value otherwise.
 
 Originally based on [rdircd] irc-daemon part,
 and intended to replace [earlier twisted-based bot].
+
+Repository URLs:
+
+- <https://github.com/mk-fg/kelp>
+- <https://codeberg.org/mk-fg/kelp>
+- <https://fraggod.net/code/git/kelp>
 
 [rdircd]: https://github.com/mk-fg/reliable-discord-client-irc-daemon
 [earlier twisted-based bot]: https://github.com/mk-fg/bordercamp-irc-bot
