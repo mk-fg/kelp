@@ -6,7 +6,7 @@ Table of Contents
 
 - [Description](#hdr-description)
 - [Usage](#hdr-usage)
-- ["blade" plugins](#hdr-_blade__plugins)
+- ["blade" plugins](#hdr-blade__plugins)
 
     - [udp-report-sink]
     - [logtail](#hdr-logtail)
@@ -74,7 +74,7 @@ as well as server control channels (#kelp.control, #kelp.debug)
 and catch-all #kelp.monitor, see topics for more info on these.
 
 
-<a name=hdr-_blade__plugins></a>
+<a name=hdr-blade__plugins></a>
 ## "blade" plugins
 
 They are actual point of the whole thing.
@@ -213,7 +213,11 @@ Config sections:
         (no tailing whitespace, newlines and such) to check if it should be affected
         by this rule. In python's "re" module format.
 
-    - `sub` - substitution pattern, second argument to python's re.sub().
+    - `sub` - substitution pattern, second argument to python's re.sub(),
+        to change the line.
+
+        When using multiple regex-replace rules in a row, regexps in follow-up
+        rules will be matched against changed lines.
 
     - `rate-tb` - token-bucket rate-limit applied to affected messages.
 
@@ -223,8 +227,18 @@ Config sections:
         Lines that go over the limit are skipped, with system message printed between
         last passed and first skipped message to indicate when rate-limiting starts.
 
-    - `filter` - either "whitelist" (default) or "blacklist" to silently drop
-        either all non-matching or matching lines respectively.
+        "skipped" means "dropped without processing rules after those" with default
+        action=process, but has inverted meaning with pass/drop actions (see below).
+
+    - `action` - either "process" (default), "pass" or "drop".
+
+        Default "process" can be used to change or rate-limit-drop lines.\
+        "pass" action immediately passes matching line through, ignoring any following rules.\
+        "drop" can be used to drop regexp-matching line instead.
+
+        pass/drop actions also invert `rate-tb` rate-limiting on the rule (if any),
+        so that only matches above the limit pass through or under-limit ones get dropped.
+        Default-action rules can be used to e.g. drop lines before whitelisting otherwise.
 
     See example below for more info.
 

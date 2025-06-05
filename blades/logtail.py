@@ -161,21 +161,23 @@ class LogTailer:
 		for k, v in self.iface.read_conf_section('logtail-files-proc').items():
 			try:
 				name, k = k.split('.', 1)
-				if k not in ['file', 're', 'sub', 'rate-tb', 'filter']: raise ValueError(k)
+				if k not in ['file', 're', 'sub', 'rate-tb', 'action']: raise ValueError(k)
 			except ValueError: raise self.iface.error(f'Invalid processing-rule suffix: {k}')
 			if name not in self.proc_rules:
 				self.proc_rules[name] = self.iface.lib.adict(name=name)
-				self.proc_rules[name].update(dict.fromkeys('file re sub rate_tb filter'.split()))
+				self.proc_rules[name].update(
+					dict.fromkeys('file re sub rate_tb filter action'.split()) )
 			if k == 'file': v = pl.Path(v).resolve()
 			elif k == 're': v = re.compile(v)
 			elif k == 'rate-tb': v = self.iface.lib.token_bucket(v)
-			elif k == 'filter': v = dict(whitelist=True, blacklist=False)[v.lower()]
+			elif k == 'filter': v = dict(whitelist=True, blacklist=False)[v.lower()] # compat
+			elif k == 'action': v = {'process': None, 'pass': True, 'drop': False}[v.lower()]
 			self.proc_rules[name][k.replace('-', '_')] = v
 		for rule in self.proc_rules.values():
 			if not (rule.file and rule.re):
 				raise self.iface.error(f'Processing-rule missing required keys: {rule}')
-			if not (rule.sub is not None or rule.rate_tb or rule.filter is not None):
-				raise self.iface.error(f'Processing-rule without action: {rule}')
+			if not (rule.rate_tb or any(v is not None for v in [rule.sub, rule.filter, rule.action])):
+				raise self.iface.error(f'Processing-rule does not seem to do anything: {rule}')
 
 	async def __aexit__(self, *err):
 		self.file_state_dir = self.file_chans = self.chan_names = self.proc_rules = None
@@ -313,25 +315,28 @@ class LogTailer:
 
 	def proc_file_updates(self, p, chan_set, buff):
 		'Process/dispatch any complete lines from buffer as msgs and return leftover bytes'
+		# action=drop + rate_tb is same as action=pass, but doesn't skip other rules
 		try: lines, buff = buff.rsplit(b'\n', 1)
 		except ValueError: return buff
 		lines = lines.decode(errors='replace')
 		for line in map(str.rstrip, lines.split('\n')):
 			for name, rule in self.proc_rules.items():
 				if rule.file != p: continue
-				m = rule.re.search(line)
-				if m:
+				if m := rule.re.search(line):
 					if rule.sub: line = m.expand(rule.sub)
 					if rule.rate_tb:
-						block = next(rule.rate_tb)
-						if block:
-							if not rule.get('rate_tb_block'):
-								line += f'\n[started rate-limiting similar messages by rule: {name}]'
-							else: line = None
-						rule.rate_tb_block = block
-				if rule.filter is not None:
-					if bool(m) != rule.filter: line = None
-				if line is None: break
+						tb_delay = next(rule.rate_tb)
+						if rule.action is None:
+							if tb_delay:
+								if rule.get('rate_tb_block'): line = None
+								else: line += f'\n[rate-limiting delay {tb_delay:,.1f}s by rule: {name}]'
+							rule.rate_tb_block = tb_delay
+						elif not tb_delay: line = None # pass over limit / drop under limit logic
+					elif rule.action is False: line = None
+				if rule.filter is not None and bool(m) is not rule.filter: line = None # compat
+				# line = ( f'{line or "-dropped-"}\n[ rule={name} m={int(bool(m))}'
+				# 	f' act={rule.action} tb_delay={m and rule.rate_tb and tb_delay} ]' )
+				if line is None or (m and rule.action is True): break
 			if line is not None:
 				for chan in chan_set: self.iface.send_msg(chan, self.chan_names[chan], line)
 		return buff
