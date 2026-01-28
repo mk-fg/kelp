@@ -11,7 +11,7 @@ import logging, logging.handlers
 
 class KelpConfigBase:
 
-	version = '1.25' # git-version: py-str
+	version = '1.26' # git-version: py-str
 
 	blades_dir = 'blades'
 	blades_enabled = ''
@@ -641,7 +641,7 @@ class IRCProtocol:
 		self.st.update(user=name, real_name=real_name)
 		self.check_auth_done()
 	def recv_cmd_nick(self, nick):
-		if not re.search(r'^[a-zA-Z-._]+$', nick):
+		if not re.fullmatch(r'[a-zA-Z-._]+', nick):
 			return self.send(432, nick, ':Erroneus nickname')
 		if self.bridge.cmd_conn(nick):
 			return self.send(433, nick, ':Nickname is already in use')
@@ -1220,7 +1220,7 @@ class KelpConfig(KelpConfigBase):
 
 	def pprint(self, title=None, empty_vals=False):
 		cat, chk = None, re.compile(
-			'^({})_(.*)$'.format('|'.join(map(re.escape, self._conf_sections))) )
+			r'^({})_(.*)\Z'.format('|'.join(map(re.escape, self._conf_sections))) )
 		if title: print(f';; {title}')
 		for k in sorted(dir(self)):
 			m = chk.search(k)
@@ -1289,7 +1289,7 @@ class KelpConfig(KelpConfigBase):
 		section = section.replace('_', '-')
 		if not path: path = self._conf_path
 		if isinstance(path, str): path = pl.Path(path)
-		sec_re, sec_k = re.compile(r'(?i)^\[\s*(\S+)\s*\]$'), str_norm(section)
+		sec_re, sec_k = re.compile(r'(?i)^\[\s*(\S+)\s*\]\Z'), str_norm(section)
 		sec_prefix = section.lower().replace('-', '_') + '_'
 		if not keys: keys = list(k for k in vars(self).keys() if k.startswith(sec_prefix))
 		if isinstance(keys, str): keys = keys.split()
